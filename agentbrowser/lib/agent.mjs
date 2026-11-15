@@ -129,6 +129,11 @@ function findField(snap, wantSearch) {
 export async function runTask(session, goal, { emit } = {}) {
   session.stats.taskRuns++;
   const note = (text, meta) => session.addLog('agent', text, meta);
+  const act = async (action) => {
+    const result = await session.act(action);
+    if (result?.blocked || result?.error) throw new Error(result.reason || result.error);
+    return result;
+  };
   const step = async (s) => { session.setAgentStatus(s); await sleep(120); };
 
   note(`task received · ${JSON.stringify(goal)}`);
@@ -143,7 +148,7 @@ export async function runTask(session, goal, { emit } = {}) {
       /* ---------- read mode: open a URL and extract ---------- */
       note(`plan: read mode · url detected → ${target}`, { plan: 1 });
       await step('reading');
-      const r = (await session.act({ op: 'open', url: target })).snapshot || (await session.snap());
+      const r = (await act({ op: 'open', url: target })).snapshot || (await session.snap());
       const txt = await session.pageText();
       answer.sources.push({ title: txt.title || target, url: txt.url });
       answer.extractedFrom.push(txt.url);
@@ -154,15 +159,15 @@ export async function runTask(session, goal, { emit } = {}) {
       /* ---------- search mode: type into a real search box ---------- */
       note(`plan: search mode · query=${JSON.stringify(q)}`, { plan: 1 });
       await step('navigating');
-      let snap = (await session.act({ op: 'open', url: 'https://www.bing.com' })).snapshot;
+      let snap = (await act({ op: 'open', url: 'https://www.bing.com' })).snapshot;
       const field = findField(snap, true);
       if (field) {
         note(`search box found · ${field.ref} (${field.role} "${field.name}") · typing it like a user`);
-        const res = await session.act({ op: 'type', ref: field.ref, text: q, submit: true });
+        const res = await act({ op: 'type', ref: field.ref, text: q, submit: true });
         snap = res.snapshot || snap;
       } else {
         note('no search box exposed · falling back to the URL form');
-        snap = (await session.act({ op: 'open', url: `https://www.bing.com/search?q=${encodeURIComponent(q)}` })).snapshot;
+        snap = (await act({ op: 'open', url: `https://www.bing.com/search?q=${encodeURIComponent(q)}` })).snapshot;
       }
 
       await step('reading results');
@@ -198,7 +203,7 @@ export async function runTask(session, goal, { emit } = {}) {
       if (best) {
         note(`opening best source to verify · ${best.url.slice(0, 90)}`);
         await step('verifying');
-        const opened = await session.act({ op: 'open', url: best.url });
+        const opened = await act({ op: 'open', url: best.url });
         const txt = await session.pageText();
         if (txt.url) { answer.extractedFrom.push(txt.url); answer.sources.unshift({ title: txt.title || best.title, url: txt.url }); }
         const deeper = summarize(txt.text + '\n' + (opened.snapshot?.bodyText || ''), q, 5);

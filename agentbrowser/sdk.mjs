@@ -1,62 +1,31 @@
-// sdk.mjs — a tiny client so *other* agents can drive this browser.
-// The browser has no human UI contract: everything is 4 primitives.
-//
-//   const b = new AgentBrowser('http://localhost:3000');
-//   await b.open('https://en.wikipedia.org/wiki/Headless_browser');
-//   const doc = await b.snapshot();        // token-cheap Agent Document
-//   await b.click('e12');
-//   await b.type('e5', 'tokyo', { submit: true });
-
+// Agent client for the headless control plane (Node 18+).
 export class AgentBrowser {
-  constructor(base = 'http://localhost:3000') {
+  constructor(base = 'http://127.0.0.1:3000', { token } = {}) {
     this.base = base.replace(/\/$/, '');
-    this.lastDoc = null;
+    this.token = token;
   }
-
-  async #post(path, body) {
-    const r = await fetch(this.base + path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body || {}),
-    });
-    return r.json();
+  async request(path, body) {
+    const headers = {};
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    if (body !== undefined) headers['content-type'] = 'application/json';
+    const r = await fetch(this.base + path, { method: body === undefined ? 'GET' : 'POST', headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    return data;
   }
-
-  /** tool: open(url) → Agent Document */
-  async open(url) { const r = await this.#post('/api/act', { op: 'open', url }); return this.#doc(r); }
-
-  /** tool: snapshot() → Agent Document (refs, roles, names, tokens) */
-  async snapshot() {
-    const r = await fetch(this.base + '/api/state').then((x) => x.json());
-    this.lastDoc = r.snapshot || null;
-    return this.lastDoc;
+  async act(action) {
+    const { result } = await this.request('/api/act', action);
+    if (result?.blocked || result?.error) throw new Error(result.reason || result.error);
+    return result?.snapshot ?? null;
   }
-
-  /** tool: click(ref) */
-  async click(ref) { const r = await this.#post('/api/act', { op: 'click', ref }); return this.#doc(r); }
-
-  /** tool: type(ref, text, {submit}) */
-  async type(ref, text, { submit = false } = {}) { const r = await this.#post('/api/act', { op: 'type', ref, text, submit }); return this.#doc(r); }
-
-  /** tool: scroll(dy) */
-  async scroll(dy = 700) { const r = await this.#post('/api/act', { op: 'scroll', dy }); return this.#doc(r); }
-
-  /** tool: navigate(back|forward|reload) */
-  async nav(op) { const r = await this.#post('/api/act', { op }); return this.#doc(r); }
-
-  /** tool: answer(goal) → { bullets, sources } — the built-in planner does the whole task */
-  async task(goal) { const r = await this.#post('/api/task', { goal }); return r.answer; }
-
-  async #doc(r) {
-    if (r?.result?.blocked) return { blocked: true, reason: r.result.reason };
-    return this.snapshot();
-  }
-}
-
-// demo when run directly: `node sdk.mjs`
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const b = new AgentBrowser(process.env.AB || 'http://localhost:3000');
-  const doc = await b.open('https://en.wikipedia.org/wiki/Headless_browser');
-  console.log(doc.text.split('\n').slice(0, 14).join('\n'));
-  console.log(`\n— ${doc.tokens} tokens, ${doc.boxes.length} actionable refs`);
+  open(url) { return this.act({ op: 'open', url }); }
+  async snapshot() { return this.act({ op: 'snapshot' }); }
+  click(ref) { return this.act({ op: 'click', ref }); }
+  type(ref, text, { submit = false } = {}) { return this.act({ op: 'type', ref, text, submit }); }
+  scroll(dy = 700) { return this.act({ op: 'scroll', dy }); }
+  nav(op) { if (!['back', 'forward', 'reload'].includes(op)) throw new Error('invalid navigation operation'); return this.act({ op }); }
+  async tabs(op = 'list', id) { return op === 'list' ? (await this.state()).tabs : (await this.request('/api/tab', { op, id })).tabs; }
+  async state() { return this.request('/api/state'); }
+  async task(goal) { const { answer } = await this.request('/api/task', { goal }); if (!answer?.ok) throw new Error(answer?.error || 'task failed'); return answer; }
+  async approve(id, allow) { return this.request('/api/approval', { id, allow }); }
 }

@@ -30,6 +30,7 @@ export class Session {
     this.stats = { actions: 0, snapshots: 0, tokens: 0, htmlBytes: 0, approvals: 0, taskRuns: 0 };
     this.lastActionAt = 0;
     this.agentStatus = 'idle';
+    this.actionQueue = Promise.resolve();
   }
 
   // ---------- plumbing ----------
@@ -65,6 +66,12 @@ export class Session {
       colorScheme: 'light',
       timezoneId: 'Asia/Kolkata',
     });
+    // Apply host policy to browser requests too, including redirects and subresources.
+    await this.ctx.route('**/*', async (route) => {
+      const check = this.policy.hostAllowed(route.request().url());
+      if (!check.ok) { this.addLog('policy', `request refused · ${check.reason}`); await route.abort('blockedbyclient'); }
+      else await route.continue();
+    });
     await this.ctx.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -88,6 +95,7 @@ export class Session {
     page.on('framenavigated', (f) => { if (f === page.mainFrame()) this.emit('nav', { url: f.url() }); });
     this.tabs.push({ id, page, createdAt: Date.now() });
     this.activeId = id;
+    this.snapshot = null; this.shotBuf = null;
     if (url && url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => {
       this.addLog('err', `navigation failed: ${e.message.slice(0, 120)}`);
     });
@@ -102,12 +110,19 @@ export class Session {
     if (i < 0) return;
     try { await this.tabs[i].page.close(); } catch {}
     this.tabs.splice(i, 1);
-    if (this.activeId === id) this.activeId = this.tabs[0]?.id || null;
+    if (this.activeId === id) {
+      this.activeId = this.tabs[0]?.id || null;
+      this.snapshot = null; this.shotBuf = null;
+      if (this.activeId) await this.snap();
+    }
     this.emit('state', { state: this.state() });
   }
 
-  selectTab(id) {
-    if (this.tabs.some((t) => t.id === id)) { this.activeId = id; this.emit('state', { state: this.state() }); }
+  async selectTab(id) {
+    if (!this.tabs.some((t) => t.id === id)) throw new Error('unknown tab');
+    this.activeId = id;
+    this.snapshot = null; this.shotBuf = null;
+    await this.snap();
   }
 
   tabList() {
@@ -137,7 +152,6 @@ export class Session {
     this.stats.snapshots++;
     this.stats.tokens += s.tokens;
     this.stats.htmlBytes += s.htmlBytes;
-    await this.capture();
     this.emit('state', { state: this.state() });
     return s;
   }
@@ -207,6 +221,12 @@ export class Session {
   }
 
   async act(a) {
+    const run = this.actionQueue.then(() => this.actNow(a));
+    this.actionQueue = run.catch(() => {});
+    return run;
+  }
+
+  async actNow(a) {
     await this.init();
     await this.waitPause();
     await this.throttle();
@@ -230,7 +250,9 @@ export class Session {
           await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
           await sleep(250);
         } catch (e) {
-          this.addLog('err', `load problem: ${e.message.split('\n')[0].slice(0, 140)}`);
+          const error = `load problem: ${e.message.split('\n')[0].slice(0, 140)}`;
+          this.addLog('err', error);
+          return { error };
         }
         this.setAgentStatus('reading');
         return { ok: true, snapshot: await this.snap() };
@@ -240,7 +262,8 @@ export class Session {
         const loc = page.locator(`[data-agent-ref="${a.ref}"]`).first();
         const box = this.snapshot?.boxes?.find((b) => b.ref === a.ref);
         if (!box) return { blocked: true, reason: `unknown ref ${a.ref} — take a snapshot first` };
-        const verdict = this.policy.inspect({ name: box.name, href: '', text: box.role });
+        const href = await loc.getAttribute('href').catch(() => '');
+        const verdict = this.policy.inspect({ name: box.name, href, text: box.role });
         if (verdict.requireApproval) {
           const allow = await this.requestApproval({ reason: verdict.reason, detail: `click ${a.ref} "${box.name}"`, rule: verdict.rule });
           if (!allow) { this.addLog('policy', `action denied · click ${a.ref}`); return { blocked: true, reason: 'denied by human' }; }
@@ -283,16 +306,6 @@ export class Session {
         }
       }
 
-      case 'press': {
-        this.addLog('act', `press ${a.key}`);
-        try {
-          await page.keyboard.press(String(a.key || 'Enter'));
-          await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
-          await sleep(300);
-          return { ok: true, snapshot: await this.snap() };
-        } catch (e) { return { error: e.message.slice(0, 160) }; }
-      }
-
       case 'scroll': {
         const dy = a.dy ?? 700;
         this.addLog('act', `scroll ${dy > 0 ? 'down' : 'up'} ${Math.abs(dy)}px`);
@@ -316,10 +329,10 @@ export class Session {
         return { ok: true, snapshot: await this.snap() };
       }
 
-      case 'snapshot':
-      default: {
+      case 'snapshot': {
         return { ok: true, snapshot: await this.snap() };
       }
+      default: throw new Error(`unknown action: ${a.op}`);
     }
   }
 
