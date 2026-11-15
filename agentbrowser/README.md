@@ -1,29 +1,52 @@
 # AgentBrowser
 
-একটি headless browser control plane, মানুষের browsing UI নয়। Agent-রা HTTP API, JavaScript SDK অথবা MCP stdio bridge দিয়ে Chromium চালাতে পারে। পেজ থেকে সংক্ষিপ্ত text ও actionable `e1`, `e2` ref-সহ Agent Document পাওয়া যায়। Built-in research plannerটি heuristic, LLM নয়।
+একটি headless browser control plane, মানুষের browsing UI নয়। AI agent-রা **HTTP API**, **JavaScript SDK**, **MCP stdio** (remote অথবা embedded), কিংবা **Streamable HTTP MCP (`/mcp`)** দিয়ে Chromium চালাতে পারে। পেজ থেকে কম token-এ actionable `e1..eN` ref, label ও element state-সহ compact **Agent Document** তৈরি হয়।
+
+## প্রধান বৈশিষ্ট্য
+
+- **Smart Agent Document (`lib/snapshot.mjs`):** active modal, viewport এবং `<main>`/`<article>`/`<form>`-কে অগ্রাধিকার দেয়; `<label for>`, `aria-labelledby`, icon alt, `disabled`/`checked`/`required`/`expanded` state, `<select>` options, open Shadow DOM এবং same-origin `<iframe>` সমর্থন করে।
+- **১৫টি Agent Tool (`tools.mjs`):** `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_hover`, `browser_scroll`, `browser_wait`, `browser_read`, `browser_screenshot`, `browser_upload`, `browser_navigate`, `browser_tabs`, `browser_task`।
+- **Multi-Session Isolation (`lib/manager.mjs`):** একটিমাত্র shared Chromium প্রসেসের ওপর আলাদা `BrowserContext`-ভিত্তিক session (`x-session-id` / `Mcp-Session-Id`), idle TTL cleanup ও automatic crash recovery।
+- **Security & Guardrails (`lib/policy.mjs`):** ডিফল্টে private/loopback/metadata IP ও DNS-rebinding SSRF ব্লক, label-aware domain allow/block list, constant-time Bearer auth, password log masking, jailed file upload, এবং timeout-সহ human approval gate (ইংরেজি ও বাংলা)।
+- **Multi-Engine Planner (`lib/agent.mjs`):** DuckDuckGo → Bing → Brave (এবং ঐচ্ছিক SearXNG) fallback, Unicode/বাংলা-সচেতন extractive summary, per-task action budget, এবং ঐচ্ছিক OpenAI-compatible LLM synthesis hook।
 
 ## চালানো
 
-Node.js 18+ প্রয়োজন।
+**Node.js 20+** প্রয়োজন।
 
 ```sh
 cd agentbrowser
 npm ci
-npx playwright install chromium  # Linux system dependencies-ও লাগতে পারে
-npm start                        # ডিফল্ট: 127.0.0.1:3000
+npx playwright install chromium   # Linux-এ প্রয়োজন হলে: npx playwright install --with-deps chromium
+npm start                         # ডিফল্ট: http://127.0.0.1:3000 (MCP: http://127.0.0.1:3000/mcp)
 ```
 
-নেটওয়ার্কে প্রকাশ করতে হলে authentication token অবশ্যই দিন এবং TLS/reverse proxy ব্যবহার করুন:
+Repo root থেকেও সরাসরি `npm run setup`, `npm start`, `npm test` চালানো যায়।
+
+নেটওয়ার্কে প্রকাশ করতে হলে authentication token আবশ্যক এবং সামনে TLS/reverse proxy রাখুন:
 
 ```sh
 HOST=0.0.0.0 PORT=3000 AGENT_BROWSER_TOKEN='a-long-random-secret' npm start
 ```
 
-Token সেট করলে সব HTTP endpoint-এ `Authorization: Bearer <token>` প্রয়োজন। Browser service নিজে TLS সরবরাহ করে না। Token ছাড়া non-loopback bind নিষিদ্ধ। এটি একটিমাত্র shared browser session; trusted agents-দের মধ্যে ব্যবহার করুন।
+Token সেট করলে সব HTTP ও `/mcp` endpoint-এ `Authorization: Bearer <token>` প্রয়োজন। Token ছাড়া non-loopback bind নিষিদ্ধ।
 
-## MCP agent সংযোগ
+## MCP সংযোগ (৩টি উপায়)
 
-HTTP server আলাদাভাবে চালু রেখে MCP client-এ stdio command কনফিগার করুন (path নিজের checkout অনুযায়ী বদলান):
+### ১) Embedded stdio (আলাদা server চালাতে হবে না)
+
+```json
+{
+  "mcpServers": {
+    "agentbrowser": {
+      "command": "node",
+      "args": ["/absolute/path/to/agentbrowser/mcp.mjs", "--embedded"]
+    }
+  }
+}
+```
+
+### ২) Remote stdio bridge (চলমান HTTP control plane-এর সাথে)
 
 ```json
 {
@@ -33,31 +56,88 @@ HTTP server আলাদাভাবে চালু রেখে MCP client-এ
       "args": ["/absolute/path/to/agentbrowser/mcp.mjs"],
       "env": {
         "AGENT_BROWSER_URL": "http://127.0.0.1:3000",
-        "AGENT_BROWSER_TOKEN": "your-token-if-enabled"
+        "AGENT_BROWSER_TOKEN": "your-token-if-enabled",
+        "AGENT_BROWSER_SESSION": "agent-1"
       }
     }
   }
 }
 ```
 
-MCP tools: `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_navigate`, `browser_tabs`, `browser_task`। `GET /api/tools`-এ একই tool catalogue পাওয়া যায়। MCP bridge কেবল tool transport; এটি browser server চালু করে না।
+### ৩) Streamable HTTP MCP
+
+সরাসরি `POST http://127.0.0.1:3000/mcp`-এ JSON-RPC 2.0 পাঠান (ঐচ্ছিক `Mcp-Session-Id` ও `Authorization: Bearer <token>` header-সহ; session বন্ধ করতে `DELETE /mcp`)।
+
+Token বাঁচাতে MCP tool-গুলো ডিফল্টে compact text ফরম্যাটে Agent Document ফেরত দেয় (`browser_snapshot`-এ `{ "full": true }` দিলে `boxes` পাওয়া যায়) এবং `browser_screenshot` সরাসরি MCP `image/jpeg` content পাঠায়।
 
 ## JavaScript SDK
 
 ```js
 import { AgentBrowser } from './sdk.mjs';
-const browser = new AgentBrowser('http://127.0.0.1:3000', { token: process.env.AGENT_BROWSER_TOKEN });
+
+const browser = new AgentBrowser('http://127.0.0.1:3000', {
+  token: process.env.AGENT_BROWSER_TOKEN,
+  sessionId: 'research-1', // ঐচ্ছিক isolated session (ডিফল্ট: "default")
+  timeoutMs: 60_000,
+});
+
 const page = await browser.open('https://example.com');
 console.log(page.text, page.boxes);
-// await browser.click('e1'); // সবসময় সর্বশেষ snapshot-এর ref ব্যবহার করুন
+
+// Element ও page actions (সর্বশেষ snapshot-এর ref ব্যবহার করুন)
+// await browser.click('e1');
+// await browser.type('e2', 'hello', { submit: true });
+// await browser.select('e3', 'বাংলা');
+// await browser.press('Escape');
+// await browser.hover('e4');
+// await browser.wait({ text: 'Done', timeoutMs: 5000 });
+// const article = await browser.read({ maxChars: 15000 });
+// const jpegBuf = await browser.screenshot({ fullPage: false });
 ```
 
-অন্য integration-এর জন্য `POST /api/act`-এ `{ "op": "open", "url": "https://example.com" }` পাঠান। `GET /api/state`, `GET /api/events` (SSE), `POST /api/tab`, `POST /api/task`, `POST /api/policy`, `POST /api/pause`, `POST /api/reset` এবং `POST /api/approval` আছে। POST-এ JSON content type আবশ্যক। Action result-এ `blocked` বা `error` থাকতে পারে; SDK এগুলো exception হিসেবে প্রকাশ করে।
+## HTTP Endpoints
 
-## Approval ও সীমাবদ্ধতা
+| Method & Path | কাজ |
+| --- | --- |
+| `GET /api/health` | Engine readiness ও active session সংখ্যা |
+| `GET /api/tools` | Tool catalogue ও JSON Schema |
+| `GET /api/sessions`, `POST /api/sessions`, `GET\|DELETE /api/sessions/:id` | Multi-session তৈরি, তালিকা, দেখা ও বন্ধ করা |
+| `GET /api/state` | বর্তমান session-এর state, tabs, snapshot, log ও pending approvals |
+| `GET /api/events` | Server-Sent Events (SSE) লাইভ স্ট্রিম |
+| `GET /api/shot.jpg` | সর্বশেষ বা নতুন (`?fresh=1`, `?fullPage=1`) JPEG screenshot |
+| `POST /api/act` | Browser action (`open`, `snapshot`, `click`, `type`, `select`, `press`, `hover`, `scroll`, `wait`, `read`, `screenshot`, `upload`, `back`, `forward`, `reload`) |
+| `POST /api/tab` | Tab পরিচালনা (`new`, `select`, `close`) |
+| `POST /api/task` | Research planner চালানো |
+| `POST /api/policy` | `approvalsEnabled`, `allowPrivateNetworks`, `approvalTimeoutMs`, `allowedHosts`, `blockedHosts` (string বা array) |
+| `POST /api/approval` | `{ "id": "a1", "allow": true }` দিয়ে ঝুঁকিপূর্ণ কাজের অনুমোদন/বাতিল |
+| `POST /api/pause` | `{ "paused": true }` দিয়ে human takeover pause/resume |
+| `POST /api/reset` | Session context, tabs, pending approval ও action budget রিসেট |
+| `GET\|POST /api/storage` | Playwright `storageState` (cookies + localStorage) export/import |
+| `GET /api/downloads` | সংরক্ষিত ডাউনলোডের তালিকা |
+| `POST\|DELETE /mcp` | Streamable HTTP MCP endpoint |
 
-কিছু বিপজ্জনক শব্দযুক্ত click বা submit approval-এর জন্য অপেক্ষা করে। আলাদা trusted supervisor `GET /api/state` বা SSE থেকে pending ID দেখে `POST /api/approval`-এ `{ "id": "a1", "allow": true }` পাঠাতে পারে। অনুমোদন না আসা পর্যন্ত সংশ্লিষ্ট action এবং তার পেছনের queued action অপেক্ষা করবে। এটিকে সম্পূর্ণ নিরাপত্তা ব্যবস্থা ভাববেন না: শব্দভিত্তিক heuristic সব বিপজ্জনক কাজ শনাক্ত করতে পারে না।
+যেকোনো session-scoped endpoint-এ `X-Session-Id: <id>` header (অথবা GET-এ `?session=<id>`) পাঠানো যায়।
 
-Host policy browser network request-এও প্রয়োগ করা হয়, তবে এটি **SSRF protection বা security sandbox নয়**: ডিফল্টে private network নিষিদ্ধ নয়, DNS rebinding ও অন্যান্য browser attack থেকে সুরক্ষার নিশ্চয়তা নেই। Untrusted agents বা websites-এর জন্য isolated container, network egress controls ও সঠিক access control ব্যবহার করুন। Chromium বর্তমানে `--no-sandbox` দিয়ে চলে। Page content ও লগে সংবেদনশীল তথ্য থাকতে পারে। Concurrent tab management ও task isolation সম্পূর্ণ নয়।
+## গুরুত্বপূর্ণ Environment Variables
 
-Tests: `npm test`. Browser end-to-end চালানোর জন্য Playwright Chromium install প্রয়োজন।
+- `HOST` (ডিফল্ট `127.0.0.1`), `PORT` (ডিফল্ট `3000`), `AGENT_BROWSER_TOKEN`
+- `ALLOW_PRIVATE_NETWORKS=1` — লোকাল/প্রাইভেট নেটওয়ার্কে অ্যাক্সেস চালু করতে (ডিফল্টে বন্ধ)
+- `AGENT_BROWSER_NO_SANDBOX=1` — সীমাবদ্ধ কন্টেইনারে Chromium `--no-sandbox` প্রয়োজন হলে (ডিফল্টে sandbox চালু)
+- `AGENT_BROWSER_VIEWPORT` (`1280x800`), `AGENT_BROWSER_LOCALE` (`en-US`), `AGENT_BROWSER_TIMEZONE` (`Asia/Kolkata`), `AGENT_BROWSER_UA`
+- `AGENT_BROWSER_MAX_SESSIONS` (`8`), `AGENT_BROWSER_SESSION_TTL_MS` (`1800000`), `AGENT_BROWSER_MAX_TABS` (`12`), `AGENT_BROWSER_MAX_ACTIONS` (`2000`), `AGENT_BROWSER_APPROVAL_TIMEOUT_MS` (`120000`)
+- `AGENT_BROWSER_UPLOAD_DIR`, `AGENT_BROWSER_DOWNLOAD_DIR` — jailed file upload ও download ফোল্ডার
+- `AGENT_BROWSER_SEARCH_ENGINES` (`duckduckgo,bing,brave`), `AGENT_BROWSER_SEARXNG_URL`
+- `AGENT_BROWSER_LLM_API_KEY`, `AGENT_BROWSER_LLM_BASE_URL`, `AGENT_BROWSER_LLM_MODEL` — ঐচ্ছিক OpenAI-compatible LLM synthesis
+
+## নিরাপত্তা ও সীমাবদ্ধতা
+
+- ঝুঁকিপূর্ণ click, form submit, credential submit এবং file upload human approval-এর জন্য অপেক্ষা করে এবং নির্ধারিত সময়ের মধ্যে উত্তর না এলে স্বয়ংক্রিয়ভাবে বাতিল হয়। তবে heuristic নিয়ম সব ঝুঁকিপূর্ণ কাজ শনাক্ত করতে পারে না।
+- ডিফল্টে private/loopback/cloud-metadata IP ও প্রাইভেট DNS রেজোলিউশন ব্লক করা হয়, তবুও untrusted agent বা website চালানোর সময় আলাদা container, OS sandbox এবং network egress firewall ব্যবহার করুন।
+
+## টেস্ট
+
+```sh
+npm test          # সব unit, integration এবং (Chromium থাকলে) E2E test
+npm run test:unit # Chromium ছাড়াই দ্রুত unit + integration test
+npm run test:e2e  # Playwright Chromium end-to-end test
+```
