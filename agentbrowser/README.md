@@ -40,7 +40,7 @@ HTTP server আলাদাভাবে চালু রেখে MCP client-এ
 }
 ```
 
-MCP tools: `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_navigate`, `browser_tabs`, `browser_task`। `GET /api/tools`-এ একই tool catalogue পাওয়া যায়। MCP bridge কেবল tool transport; এটি browser server চালু করে না।
+MCP tools: `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_navigate`, `browser_tabs`, `browser_extract`, `browser_wait_for`, `browser_screenshot`, `browser_task`। `browser_extract` দিয়ে text, rendered HTML, Markdown, links এবং forms পাওয়া যায়; screenshot MCP image হিসেবে ফেরত আসে। Forms-এ field value থাকে না, তবে অন্য extraction format-এ পেজের সংবেদনশীল তথ্য থাকতে পারে। `GET /api/tools`-এ একই tool catalogue পাওয়া যায়। MCP bridge কেবল tool transport; এটি browser server চালু করে না।
 
 ## JavaScript SDK
 
@@ -49,10 +49,30 @@ import { AgentBrowser } from './sdk.mjs';
 const browser = new AgentBrowser('http://127.0.0.1:3000', { token: process.env.AGENT_BROWSER_TOKEN });
 const page = await browser.open('https://example.com');
 console.log(page.text, page.boxes);
+const markdown = await browser.extract('markdown');
+console.log(markdown.content);
+await browser.waitFor('main', 10000);
+const image = await browser.screenshot(); // { mimeType, base64 }
 // await browser.click('e1'); // সবসময় সর্বশেষ snapshot-এর ref ব্যবহার করুন
 ```
 
 অন্য integration-এর জন্য `POST /api/act`-এ `{ "op": "open", "url": "https://example.com" }` পাঠান। `GET /api/state`, `GET /api/events` (SSE), `POST /api/tab`, `POST /api/task`, `POST /api/policy`, `POST /api/pause`, `POST /api/reset` এবং `POST /api/approval` আছে। POST-এ JSON content type আবশ্যক। Action result-এ `blocked` বা `error` থাকতে পারে; SDK এগুলো exception হিসেবে প্রকাশ করে।
+
+## One-shot CLI
+
+HTTP server ছাড়াই Chromium দিয়ে পেজ খুলে পাইপ করা যায়:
+
+```sh
+node cli.mjs fetch https://example.com --dump markdown
+node cli.mjs fetch https://example.com --dump links
+node cli.mjs fetch https://example.com --dump text --max-chars 10000
+```
+
+`--dump`-এর format: `text`, `html`, `markdown`, `links`, `forms`। Links ও forms JSON; অন্য format text। প্রয়োজনে `CHROMIUM_EXECUTABLE_PATH` দিয়ে বিদ্যমান Chromium executable নির্দিষ্ট করা যায়।
+
+## Obscura থেকে পার্থক্য
+
+[Obscura](https://github.com/h4ckf0r0day/obscura) নিজস্ব Rust/V8 engine ও CDP implementation ব্যবহার করে। এই project Chromium + Playwright ব্যবহার করে; Obscura-এর memory, speed, stealth বা সম্পূর্ণ tool/CDP compatibility-এর দাবি করা হচ্ছে না। MCP bridge চালাতে HTTP server আলাদা করে চালু রাখতে হয়। Snapshot ref-গুলো কেবল সর্বশেষ snapshot-এর জন্য বৈধ; navigation বা page পরিবর্তনের পরে আবার snapshot নিন। Extraction সীমাবদ্ধ এবং পূর্ণ accessibility tree নয়।
 
 ## Approval ও সীমাবদ্ধতা
 

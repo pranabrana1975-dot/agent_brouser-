@@ -5,7 +5,7 @@
 // act on deterministically. Every actionable element gets a short ref (e1..eN);
 // the agent never needs CSS selectors, XPath or coordinates.
 
-const PAGE_PROBE = () => {
+const PAGE_PROBE = (startRef = 0) => {
   document.querySelectorAll('[data-agent-ref]').forEach((el) => el.removeAttribute('data-agent-ref'));
 
   const MAX_ACTIONS = 90;
@@ -13,7 +13,8 @@ const PAGE_PROBE = () => {
   const MAX_TEXT = 14;
 
   const nodes = [];
-  let n = 0;
+  let n = startRef;
+  let count = 0;
 
   const rectOf = (el) => {
     const r = el.getBoundingClientRect();
@@ -58,10 +59,11 @@ const PAGE_PROBE = () => {
   };
 
   const push = (el, kind, extra) => {
-    if (n >= MAX_ACTIONS) return;
+    if (count >= MAX_ACTIONS) return;
     const r = rectOf(el);
     if (!r) return;
     const ref = 'e' + ++n;
+    count++;
     el.setAttribute('data-agent-ref', ref);
     nodes.push({
       ref,
@@ -175,7 +177,7 @@ export function renderDoc(raw) {
   };
 }
 
-export async function takeSnapshot(page) {
-  const raw = await page.evaluate(PAGE_PROBE);
+export async function takeSnapshot(page, startRef = 0) {
+  const raw = await page.evaluate(PAGE_PROBE, startRef);
   return renderDoc(raw);
 }

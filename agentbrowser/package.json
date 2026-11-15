@@ -7,10 +7,18 @@
   "scripts": {
     "start": "node server.mjs",
     "mcp": "node mcp.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "fetch": "node cli.mjs fetch"
   },
   "dependencies": {
-    "playwright": "^1.65.1"
+    "playwright": "^1.65.1",
+    "turndown": "^7.2.5"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "bin": {
+    "agentbrowser": "./cli.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
 }
