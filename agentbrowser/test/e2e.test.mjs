@@ -23,7 +23,7 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
     if (req.url === '/frame') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><html><body>
-        <button id="fb" onclick="this.textContent='Frame Clicked'">Confirm Inside Frame</button>
+        <button id="fb" onclick="this.textContent='Frame Clicked'">Action Inside Frame</button>
       </body></html>`);
       return;
     }
@@ -69,6 +69,7 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
   t.after(async () => {
     await ctrl.close();
     await manager.shutdown();
+    fixture.closeAllConnections?.();
     await new Promise((r) => fixture.close(r));
   });
 
@@ -81,7 +82,7 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
   assert.match(page.text, /textbox "Username" \[required\]/);
   assert.match(page.text, /combobox "Language"/);
   assert.match(page.text, /button "Toggle Shadow"/);
-  assert.match(page.text, /button "Confirm Inside Frame" \[frame=f1\]/);
+  assert.match(page.text, /button "Action Inside Frame" \[frame=f1\]/);
 
   // Type username + masked password, select Bangla option, click Shadow DOM & iframe buttons
   const refByName = (s, name) => s.boxes.find((b) => b.name === name)?.ref;
@@ -95,7 +96,7 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
   page = await sdk.click(refByName(page, 'Toggle Shadow'));
   assert.match(page.text, /Shadow Toggled/);
 
-  page = await sdk.click(refByName(page, 'Confirm Inside Frame'));
+  page = await sdk.click(refByName(page, 'Action Inside Frame'));
   assert.match(page.text, /Frame Clicked/);
 
   // Reader keeps `.coronavirus-update` prose intact

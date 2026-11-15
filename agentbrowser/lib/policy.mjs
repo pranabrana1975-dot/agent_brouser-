@@ -425,12 +425,12 @@ export class Policy {
       return { requireApproval: false };
     }
 
-    // Submitting populated credentials requires approval (without blocking unrelated links).
+    // Submitting populated credentials requires approval (without blocking unrelated buttons/links).
     if (hasPassword) {
       const submittingCredentials =
         (op === 'type' && action.submit)
         || op === 'press'
-        || (op === 'click' && (role === 'button' || this.isSubmitControl({ role, inputType, name })));
+        || (op === 'click' && this.isSubmitControl({ role, inputType, name }));
       if (submittingCredentials) {
         return {
           requireApproval: this.approvalsEnabled,
