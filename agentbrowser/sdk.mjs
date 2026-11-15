@@ -16,12 +16,15 @@ export class AgentBrowser {
   async act(action) {
     const { result } = await this.request('/api/act', action);
     if (result?.blocked || result?.error) throw new Error(result.reason || result.error);
-    return result?.snapshot ?? null;
+    return result?.data ?? result?.snapshot ?? null;
   }
   open(url) { return this.act({ op: 'open', url }); }
   async snapshot() { return this.act({ op: 'snapshot' }); }
   click(ref) { return this.act({ op: 'click', ref }); }
   type(ref, text, { submit = false } = {}) { return this.act({ op: 'type', ref, text, submit }); }
+  extract(format = 'text', maxChars = 20000) { return this.act({ op: 'extract', format, maxChars }); }
+  waitFor(selector, timeoutMs = 10000) { return this.act({ op: 'wait', selector, timeoutMs }); }
+  screenshot() { return this.act({ op: 'screenshot' }); }
   scroll(dy = 700) { return this.act({ op: 'scroll', dy }); }
   nav(op) { if (!['back', 'forward', 'reload'].includes(op)) throw new Error('invalid navigation operation'); return this.act({ op }); }
   async tabs(op = 'list', id) { return op === 'list' ? (await this.state()).tabs : (await this.request('/api/tab', { op, id })).tabs; }

@@ -3,6 +3,7 @@
 
 import { chromium } from 'playwright';
 import { takeSnapshot } from './snapshot.mjs';
+import { extractPage } from './extract.mjs';
 import { Policy, MIN_ACTION_INTERVAL_MS, MAX_ACTIONS_PER_TASK } from './policy.mjs';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -13,9 +14,11 @@ export class Session {
   constructor() {
     this.browser = null;
     this.ctx = null;
+    this.initializing = null;
     this.tabs = [];
     this.activeId = null;
     this.nextTab = 1;
+    this.nextRef = 0;
     this.log = [];
     this.listeners = new Set();
     this.policy = new Policy();
@@ -55,8 +58,17 @@ export class Session {
   }
 
   async init() {
-    if (this.browser) return;
+    if (this.initializing) return this.initializing;
+    if (this.browser && this.ctx) return;
+    this.initializing = this.launch();
+    try { await this.initializing; }
+    catch (e) { await this.shutdown(); this.browser = null; this.ctx = null; throw e; }
+    finally { this.initializing = null; }
+  }
+
+  async launch() {
     this.browser = await chromium.launch({
+      ...(process.env.CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.CHROMIUM_EXECUTABLE_PATH } : {}),
       args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', '--disable-gpu'],
     });
     this.ctx = await this.browser.newContext({
@@ -75,7 +87,7 @@ export class Session {
     await this.ctx.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
-    await this.newTab('about:blank');
+    await this.newTab('about:blank', true);
     this.addLog('sys', `engine up · Chromium ${this.browser.version()} · viewport 1280×800`);
   }
 
@@ -84,8 +96,8 @@ export class Session {
     return t ? t.page : null;
   }
 
-  async newTab(url) {
-    await this.init0();
+  async newTab(url, initializing = false) {
+    if (!initializing) await this.init();
     const page = await this.ctx.newPage();
     const id = 't' + this.nextTab++;
     page.on('dialog', async (d) => {
@@ -102,8 +114,6 @@ export class Session {
     this.emit('state', { state: this.state() });
     return id;
   }
-
-  async init0() { if (!this.browser) await this.init(); }
 
   async closeTab(id) {
     const i = this.tabs.findIndex((t) => t.id === id);
@@ -147,7 +157,8 @@ export class Session {
   async snap() {
     const page = this.active();
     if (!page) return null;
-    const s = await takeSnapshot(page);
+    const s = await takeSnapshot(page, this.nextRef);
+    this.nextRef += s.boxes.length;
     this.snapshot = s;
     this.stats.snapshots++;
     this.stats.tokens += s.tokens;
@@ -288,7 +299,7 @@ export class Session {
           const allow = await this.requestApproval({ reason: verdict.reason, detail: `type + submit in ${a.ref} "${box.name}"`, rule: verdict.rule });
           if (!allow) return { blocked: true, reason: 'denied by human' };
         }
-        this.addLog('act', `type ${a.ref} ← ${JSON.stringify(String(a.text).slice(0, 80))}${a.submit ? ' + Enter' : ''}`);
+        this.addLog('act', `type ${a.ref}${a.submit ? ' + Enter' : ''}`);
         try {
           const loc = page.locator(`[data-agent-ref="${a.ref}"]`).first();
           await loc.click({ timeout: 5000 }).catch(() => {});
@@ -327,6 +338,24 @@ export class Session {
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
         await sleep(250);
         return { ok: true, snapshot: await this.snap() };
+      }
+
+      case 'extract': {
+        const data = await extractPage(page, a.format, a.maxChars);
+        return { ok: true, data };
+      }
+
+      case 'wait': {
+        if (typeof a.selector !== 'string' || !a.selector.trim() || a.selector.length > 1000) throw new Error('selector required');
+        const timeout = a.timeoutMs ?? 10000;
+        if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30000) throw new Error('timeoutMs must be between 1 and 30000');
+        await page.locator(a.selector).first().waitFor({ state: 'visible', timeout });
+        return { ok: true, snapshot: await this.snap() };
+      }
+
+      case 'screenshot': {
+        const image = await page.screenshot({ type: 'png', fullPage: false, timeout: 10000 });
+        return { ok: true, data: { mimeType: 'image/png', base64: image.toString('base64') } };
       }
 
       case 'snapshot': {
