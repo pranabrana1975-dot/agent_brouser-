@@ -1,7 +1,7 @@
 {
   "name": "agentbrowser",
-  "version": "1.1.0",
-  "description": "Headless browser control plane, CLI, JavaScript SDK, and MCP tools for AI agents",
+  "version": "1.2.0",
+  "description": "Headless browser control plane, F12 Agent DevTools, CLI, JavaScript SDK, and MCP tools for AI agents",
   "type": "module",
   "main": "server.mjs",
   "bin": {
@@ -22,8 +22,9 @@
     "mcp": "node mcp.mjs",
     "mcp:embedded": "node mcp.mjs --embedded",
     "fetch": "node cli.mjs fetch",
+    "inspect": "node cli.mjs inspect",
     "test": "node --test",
-    "test:unit": "node --test test/core.test.mjs test/extract.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs",
+    "test:unit": "node --test test/core.test.mjs test/extract.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs test/devtools.test.mjs",
     "test:e2e": "node --test test/e2e.test.mjs test/browser.integration.test.mjs"
   },
   "dependencies": {

@@ -5,7 +5,7 @@ import { tools } from '../tools.mjs';
 import { runTask } from './agent.mjs';
 
 export const SUPPORTED_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
-export const SERVER_INFO = { name: 'agentbrowser', version: '1.1.0' };
+export const SERVER_INFO = { name: 'agentbrowser', version: '1.2.0' };
 
 function matchesSchemaSpec(spec, value) {
   if (!spec || typeof spec !== 'object') return true;
@@ -21,6 +21,20 @@ function matchesSchemaSpec(spec, value) {
     if (spec.minItems !== undefined && value.length < spec.minItems) return false;
     if (spec.maxItems !== undefined && value.length > spec.maxItems) return false;
     if (spec.items && !value.every((item) => matchesSchemaSpec(spec.items, item))) return false;
+  } else if (spec.type === 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    for (const reqKey of spec.required || []) {
+      if (!(reqKey in value) || value[reqKey] === undefined) return false;
+    }
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      const childSpec = spec.properties?.[k];
+      if (!childSpec) {
+        if (spec.additionalProperties === false) return false;
+        continue;
+      }
+      if (!matchesSchemaSpec(childSpec, v)) return false;
+    }
   } else if (spec.type && typeof value !== spec.type) {
     return false;
   }
@@ -55,9 +69,13 @@ function textContent(text) {
   return { content: [{ type: 'text', text: String(text ?? '') }] };
 }
 
+function jsonContent(value) {
+  return textContent(JSON.stringify(value));
+}
+
 function snapContent(snap, { full = false } = {}) {
   if (!snap) return textContent('(empty snapshot)');
-  if (full) return textContent(JSON.stringify(snap));
+  if (full) return jsonContent(snap);
   return textContent(snap.text || JSON.stringify(snap));
 }
 
@@ -74,9 +92,24 @@ function shotContent(shot) {
   const b64 = shot?.base64 ?? shot?.data ?? '';
   const content = [{ type: 'image', data: b64, mimeType: shot?.mimeType || 'image/png' }];
   if (shot?.url || shot?.title) {
-    content.push({ type: 'text', text: `[url] ${shot.url || ''}\n[title] ${shot.title || ''}`.trim() });
+    const header = [
+      `[url] ${shot.url || ''}`,
+      `[title] ${shot.title || ''}`,
+      shot.annotated ? '[overlay] annotated with [eN] refs' : '',
+    ].filter(Boolean).join('\n');
+    content.push({ type: 'text', text: header });
   }
   return { content };
+}
+
+function networkActionPayload(a = {}) {
+  const { op = 'list', mockStatus, ...rest } = a;
+  return {
+    op: 'network',
+    sub: op,
+    ...rest,
+    ...(op === 'mock' && mockStatus !== undefined ? { status: mockStatus } : {}),
+  };
 }
 
 // Build a tool executor backed by the HTTP SDK client.
@@ -107,19 +140,51 @@ export function createSdkExecutor(browser) {
       case 'browser_wait_for':
         return snapContent(await browser.wait({ selector: a.selector, timeoutMs: a.timeoutMs, compact: true }));
       case 'browser_extract':
-        return textContent(JSON.stringify(await browser.extract(a.format, a.maxChars)));
+        return jsonContent(await browser.extract(a.format, a.maxChars));
       case 'browser_read':
         return articleContent(await browser.read({ maxChars: a.maxChars }));
       case 'browser_screenshot':
-        return shotContent(await browser.screenshot({ fullPage: a.fullPage, type: a.type, encoding: 'object' }));
+        return shotContent(await browser.screenshot({ fullPage: a.fullPage, annotate: a.annotate, type: a.type, encoding: 'object' }));
       case 'browser_upload':
         return snapContent(await browser.upload(a.ref, a.paths, { compact: true }));
       case 'browser_navigate':
         return snapContent(await browser.nav(a.op, { compact: true }));
       case 'browser_tabs':
-        return textContent(JSON.stringify(await browser.tabs(a.op, a.id, a.url)));
+        return jsonContent(await browser.tabs(a.op, a.id, a.url));
+      // F12 DevTools
+      case 'browser_network':
+        return jsonContent(await browser.network(a));
+      case 'browser_console':
+        return jsonContent(await browser.console(a));
+      case 'browser_evaluate':
+        return jsonContent(await browser.evaluate(a.expression, { timeoutMs: a.timeoutMs }));
+      case 'browser_inspect':
+        return jsonContent(await browser.inspect({ ref: a.ref, selector: a.selector }));
+      case 'browser_a11y': {
+        const res = await browser.a11y(a);
+        return textContent(`[url] ${res?.url || ''}\n[title] ${res?.title || ''}\n\n${res?.tree || ''}`.trim());
+      }
+      case 'browser_diff':
+        return jsonContent(await browser.diff(a));
+      case 'browser_perf':
+        return jsonContent(await browser.perf());
+      case 'browser_audit':
+        return jsonContent(await browser.audit());
+      case 'browser_storage':
+        return jsonContent(await browser.storage(a));
+      case 'browser_security':
+        return jsonContent(await browser.security());
+      case 'browser_emulate': {
+        const res = await browser.emulate({ ...a, compact: true });
+        const header = `[emulation] ${JSON.stringify(res?.emulation || {})}`;
+        return textContent(res?.snapshot?.text ? `${header}\n${res.snapshot.text}` : header);
+      }
+      case 'browser_dialog':
+        return jsonContent(await browser.dialog(a));
+      case 'browser_trace':
+        return jsonContent(await browser.trace(a));
       case 'browser_task':
-        return textContent(JSON.stringify(await browser.task(a.goal)));
+        return jsonContent(await browser.task(a.goal));
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -161,11 +226,11 @@ export function createSessionExecutor(getSession) {
       case 'browser_wait_for':
         return snapContent((await unwrap(session, { op: 'wait', selector: a.selector, timeoutMs: a.timeoutMs, compact: true })).snapshot);
       case 'browser_extract':
-        return textContent(JSON.stringify((await unwrap(session, { op: 'extract', format: a.format, maxChars: a.maxChars })).data));
+        return jsonContent((await unwrap(session, { op: 'extract', format: a.format, maxChars: a.maxChars })).data);
       case 'browser_read':
         return articleContent((await unwrap(session, { op: 'read', maxChars: a.maxChars })).article);
       case 'browser_screenshot':
-        return shotContent((await unwrap(session, { op: 'screenshot', fullPage: a.fullPage, type: a.type })).data);
+        return shotContent((await unwrap(session, { op: 'screenshot', fullPage: a.fullPage, annotate: a.annotate, type: a.type })).data);
       case 'browser_upload':
         return snapContent((await unwrap(session, { op: 'upload', ref: a.ref, paths: a.paths, compact: true })).snapshot);
       case 'browser_navigate':
@@ -173,10 +238,42 @@ export function createSessionExecutor(getSession) {
       case 'browser_tabs': {
         if (a.op === 'list') {
           await session.init();
-          return textContent(JSON.stringify(session.tabList()));
+          return jsonContent(session.tabList());
         }
-        return textContent(JSON.stringify(await session.tabOp(a.op, a.id, a.url)));
+        return jsonContent(await session.tabOp(a.op, a.id, a.url));
       }
+      // F12 DevTools
+      case 'browser_network':
+        return jsonContent((await unwrap(session, networkActionPayload(a))).data);
+      case 'browser_console':
+        return jsonContent((await unwrap(session, { op: 'console', sub: a.op || 'list', level: a.level, search: a.search, sinceLastAction: a.sinceLastAction, limit: a.limit })).data);
+      case 'browser_evaluate':
+        return jsonContent((await unwrap(session, { op: 'evaluate', expression: a.expression, timeoutMs: a.timeoutMs })).data);
+      case 'browser_inspect':
+        return jsonContent((await unwrap(session, { op: 'inspect', ref: a.ref, selector: a.selector })).data);
+      case 'browser_a11y': {
+        const res = (await unwrap(session, { op: 'a11y', ref: a.ref, selector: a.selector, maxChars: a.maxChars })).data;
+        return textContent(`[url] ${res?.url || ''}\n[title] ${res?.title || ''}\n\n${res?.tree || ''}`.trim());
+      }
+      case 'browser_diff':
+        return jsonContent((await unwrap(session, { op: 'diff', sub: a.op || 'diff', sinceMark: a.sinceMark, refresh: a.refresh, clearToasts: a.clearToasts })).data);
+      case 'browser_perf':
+        return jsonContent((await unwrap(session, { op: 'perf' })).data);
+      case 'browser_audit':
+        return jsonContent((await unwrap(session, { op: 'audit' })).data);
+      case 'browser_storage':
+        return jsonContent((await unwrap(session, { op: 'storage', sub: a.op || 'inspect', targets: a.targets })).data);
+      case 'browser_security':
+        return jsonContent((await unwrap(session, { op: 'security' })).data);
+      case 'browser_emulate': {
+        const res = (await unwrap(session, { op: 'emulate', ...a, compact: true })).data;
+        const header = `[emulation] ${JSON.stringify(res?.emulation || {})}`;
+        return textContent(res?.snapshot?.text ? `${header}\n${res.snapshot.text}` : header);
+      }
+      case 'browser_dialog':
+        return jsonContent((await unwrap(session, { op: 'dialog', sub: a.op || 'list', action: a.action, promptText: a.promptText, once: a.once })).data);
+      case 'browser_trace':
+        return jsonContent((await unwrap(session, { op: 'trace', sub: a.op, screenshots: a.screenshots, snapshots: a.snapshots, sources: a.sources })).data);
       case 'browser_task': {
         const goal = String(a.goal || '').trim();
         if (!goal) throw new Error('goal required');
@@ -189,7 +286,7 @@ export function createSessionExecutor(getSession) {
         })();
         const answer = await session.busy;
         if (!answer?.ok) throw new Error(answer?.error || 'task failed');
-        return textContent(JSON.stringify(answer));
+        return jsonContent(answer);
       }
       default:
         throw new Error(`Unknown tool: ${name}`);

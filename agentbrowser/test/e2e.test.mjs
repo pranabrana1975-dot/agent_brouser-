@@ -20,6 +20,11 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
 
   // Local fixture web server
   const fixture = http.createServer((req, res) => {
+    if (req.url === '/api/profile') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ user: 'pranab', plan: 'pro' }));
+      return;
+    }
     if (req.url === '/frame') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><html><body>
@@ -32,8 +37,14 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
       res.end(`<!doctype html><html><head><title>Popup Doc</title></head><body><h1>Popup Opened</h1></body></html>`);
       return;
     }
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(`<!doctype html><html><head><title>Fixture App</title></head><body>
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(`<!doctype html><html lang="en"><head>
+      <title>Fixture App</title>
+      <meta property="og:title" content="Fixture OG" />
+    </head><body>
       <nav><a href="#top">Home</a></nav>
       <main>
         <h1>AgentBrowser E2E</h1>
@@ -41,12 +52,18 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
         <label for="pw">Password</label><input id="pw" type="password" />
         <label for="lang">Language</label>
         <select id="lang"><option value="en">English</option><option value="bn">বাংলা</option></select>
+        <button id="toast-btn" onclick="const d=document.createElement('div');d.setAttribute('role','alert');d.textContent='Profile synced!';document.body.appendChild(d);setTimeout(()=>d.remove(),50);">Trigger Toast</button>
         <a href="/popup" target="_blank">Open Popup</a>
         <div id="shadow-host"></div>
         <iframe src="/frame" width="320" height="80"></iframe>
+        <table><thead><tr><th>Tool</th><th>Ready</th></tr></thead><tbody><tr><td>DevTools</td><td>Yes</td></tr></tbody></table>
         <p class="coronavirus-update">This paragraph contains important scientific results that must never be stripped by reader selectors.</p>
       </main>
       <script>
+        localStorage.setItem('ui_mode', 'compact');
+        localStorage.setItem('api_token', 'must-stay-redacted');
+        console.warn('fixture boot warning');
+        fetch('/api/profile', { headers: { Authorization: 'Bearer super-secret-header' } });
         const sr = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
         const b = document.createElement('button');
         b.textContent = 'Toggle Shadow';
@@ -103,12 +120,65 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
   const article = await sdk.read();
   assert.match(article.text, /important scientific results/);
 
-  // Real screenshot (both object and JPEG buffer forms)
-  const shot = await sdk.screenshot();
+  // Real screenshot (plain, annotated Set-of-Mark, and JPEG buffer forms)
+  const shot = await sdk.screenshot({ annotate: true });
   assert.equal(shot.mimeType, 'image/png');
+  assert.equal(shot.annotated, true);
   const jpg = await sdk.screenshot({ type: 'jpeg', encoding: 'buffer' });
   assert.equal(jpg[0], 0xff);
   assert.equal(jpg[1], 0xd8);
+
+  // F12 DevTools E2E: Network JSON + redaction, Console, Inspect, A11y, Toast+Diff, Perf+CDP, Audit, Storage, Security, Emulate, Tables/Metadata, Trace
+  await sdk.trace('start');
+  const netList = await sdk.network({ resourceType: 'api' });
+  assert.ok(netList.requests.length >= 1);
+  const apiEntry = await sdk.network(netList.requests[0].id);
+  assert.deepEqual(apiEntry.json, { user: 'pranab', plan: 'pro' });
+  assert.equal(apiEntry.requestHeaders.authorization, '[REDACTED]');
+
+  const cons = await sdk.console({ level: 'warning' });
+  assert.ok(cons.entries.some((c) => c.text.includes('fixture boot warning')));
+
+  const elem = await sdk.inspect('#u');
+  assert.equal(elem.tag, 'input');
+  assert.equal(elem.clickability.clickable, true);
+  assert.ok(elem.boxModel.width > 0);
+
+  const a11y = await sdk.a11y();
+  assert.match(a11y.tree, /AgentBrowser E2E/);
+
+  page = await sdk.click(refByName(page, 'Trigger Toast'));
+  const diff = await sdk.diff({ clearToasts: true });
+  assert.ok(diff.toasts.some((item) => item.text === 'Profile synced!'));
+
+  const perf = await sdk.perf();
+  assert.ok(perf.dom.elements > 5);
+  assert.ok(perf.cdpMetrics && perf.cdpMetrics.nodes > 0);
+
+  const audit = await sdk.audit();
+  assert.ok(typeof audit.scores.overall === 'number');
+
+  const storage = await sdk.storage();
+  assert.equal(storage.localStorage.entries.find((e) => e.key === 'ui_mode')?.valuePreview, 'compact');
+  assert.equal(storage.localStorage.entries.find((e) => e.key === 'api_token')?.valuePreview, '[REDACTED]');
+
+  const sec = await sdk.security();
+  assert.equal(sec.securityHeaders.present['x-content-type-options'], 'nosniff');
+
+  const tables = await sdk.extract('tables');
+  assert.deepEqual(tables.tables[0].rows, [{ Tool: 'DevTools', Ready: 'Yes' }]);
+  const meta = await sdk.extract('metadata');
+  assert.equal(meta.metadata.openGraph['og:title'], 'Fixture OG');
+
+  const emu = await sdk.emulate({ device: 'iphone-15', colorScheme: 'dark' });
+  assert.equal(emu.emulation.viewport.width, 393);
+  const restored = await sdk.emulate({ device: 'desktop', colorScheme: 'light' });
+  assert.equal(restored.emulation.viewport.width, 1280);
+  page = restored.snapshot;
+
+  const traceRes = await sdk.trace('stop');
+  assert.ok(traceRes.bytes > 0);
+  try { fs.unlinkSync(traceRes.path); } catch {}
 
   // Popup capture opens second tab with its own title
   page = await sdk.click(refByName(page, 'Open Popup'));

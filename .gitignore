@@ -9,6 +9,9 @@ node_modules/
 # Runtime state & artifacts
 storage-state*.json
 downloads/
+traces/
+trace-*.zip
+*.har
 coverage/
 *.log
 npm-debug.log*
