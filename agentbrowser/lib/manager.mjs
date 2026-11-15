@@ -91,12 +91,13 @@ export class SessionManager {
   }
 
   _buildSession(id, overrides = {}) {
-    const mergedPolicy = overrides.policy ?? this._sessionDefaults.policy;
+    const cleanOverrides = Object.fromEntries(
+      Object.entries(overrides).filter(([, v]) => v !== undefined),
+    );
     return new Session({
       ...this._sessionDefaults,
-      ...overrides,
+      ...cleanOverrides,
       id,
-      policy: mergedPolicy,
       getBrowser: () => this.ensureBrowser(),
     });
   }

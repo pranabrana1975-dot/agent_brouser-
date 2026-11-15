@@ -1,6 +1,9 @@
 node_modules/
 storage-state*.json
 downloads/
+traces/
+trace-*.zip
+*.har
 coverage/
 *.log
 .env

@@ -1,8 +1,8 @@
 {
   "name": "agentbrowser-workspace",
   "private": true,
-  "version": "1.1.0",
-  "description": "Headless browser control plane, JavaScript SDK, and MCP server for AI agents",
+  "version": "1.2.0",
+  "description": "Headless browser control plane, F12 Agent DevTools, CLI, JavaScript SDK, and MCP server for AI agents",
   "engines": {
     "node": ">=20"
   },
@@ -12,6 +12,7 @@
     "mcp": "npm --prefix agentbrowser run mcp",
     "mcp:embedded": "npm --prefix agentbrowser run mcp:embedded",
     "fetch": "node agentbrowser/cli.mjs fetch",
+    "inspect": "node agentbrowser/cli.mjs inspect",
     "test": "npm --prefix agentbrowser test",
     "test:e2e": "npm --prefix agentbrowser run test:e2e"
   },

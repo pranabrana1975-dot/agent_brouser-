@@ -234,13 +234,61 @@ export function createControlServer(opts = {}) {
         return json(res, 200, session.state());
       }
 
+      if (p === '/api/devtools') {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: true });
+        return json(res, 200, session.devtoolsOverview());
+      }
+
+      if (p === '/api/network') {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: true });
+        const id = url.searchParams.get('id');
+        const out = await session.act(id
+          ? { op: 'network', sub: 'get', id, maxChars: url.searchParams.get('maxChars') || undefined }
+          : {
+              op: 'network',
+              sub: 'list',
+              resourceType: url.searchParams.get('type') || undefined,
+              status: url.searchParams.get('status') || undefined,
+              url: url.searchParams.get('url') || undefined,
+              sinceLastAction: url.searchParams.get('sinceLastAction') === '1',
+              limit: url.searchParams.get('limit') || undefined,
+            });
+        if (out?.error) throw new HttpError(id ? 404 : 400, out.error);
+        return json(res, 200, { ok: true, ...out.data });
+      }
+
+      if (p === '/api/console') {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: true });
+        const out = await session.act({
+          op: 'console',
+          sub: 'list',
+          level: url.searchParams.get('level') || 'all',
+          search: url.searchParams.get('search') || '',
+          sinceLastAction: url.searchParams.get('sinceLastAction') === '1',
+          limit: url.searchParams.get('limit') || undefined,
+        });
+        return json(res, 200, { ok: true, ...out.data });
+      }
+
+      if (p === '/api/perf' || p === '/api/audit' || p === '/api/security') {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: true });
+        const out = await session.act({ op: p.slice('/api/'.length) });
+        if (out?.error) throw new HttpError(400, out.error);
+        return json(res, 200, { ok: true, ...out.data });
+      }
+
       if (p === '/api/shot.jpg') {
         requireMethod(req, 'GET');
         const session = resolveSession(manager, req, url, { create: false });
-        const wantFresh = url.searchParams.get('fresh') === '1';
+        const annotate = url.searchParams.get('annotate') === '1';
+        const wantFresh = annotate || url.searchParams.get('fresh') === '1';
         const fullPage = url.searchParams.get('fullPage') === '1';
         if ((wantFresh || !session.shotBuf) && session.active()) {
-          try { await session.capture({ fullPage }); } catch {}
+          try { await session.capture({ fullPage, annotate }); } catch {}
         }
         if (!session.shotBuf) {
           res.writeHead(404, { ...BASE_HEADERS, 'content-type': 'text/plain; charset=utf-8' });

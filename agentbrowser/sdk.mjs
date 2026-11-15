@@ -1,4 +1,4 @@
-// sdk.mjs — Agent client for the headless AgentBrowser control plane (Node 20+).
+// sdk.mjs — Agent client for the headless AgentBrowser control plane & F12 DevTools (Node 20+).
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -129,8 +129,8 @@ export class AgentBrowser {
     return res?.article ?? { title: '', url: '', text: '', length: 0, truncated: false };
   }
 
-  async screenshot({ fullPage = false, type = 'png', quality, encoding = 'object' } = {}) {
-    const res = await this._actRaw({ op: 'screenshot', fullPage, type, quality });
+  async screenshot({ fullPage = false, annotate = false, type = 'png', quality, encoding = 'object' } = {}) {
+    const res = await this._actRaw({ op: 'screenshot', fullPage, annotate, type, quality });
     const shot = res?.data ?? res?.screenshot;
     const b64 = shot?.base64 ?? shot?.data;
     if (!b64) throw new Error('screenshot capture failed');
@@ -150,6 +150,77 @@ export class AgentBrowser {
     return this.act({ op, compact });
   }
 
+  // ---------- F12 Agent DevTools ----------
+  devtools() {
+    return this.request('/api/devtools');
+  }
+
+  network(opts = {}) {
+    const { op = 'list', mockStatus, ...rest } = typeof opts === 'string' ? { op: 'get', id: opts } : opts;
+    return this.act({
+      op: 'network',
+      sub: op,
+      ...rest,
+      ...(mockStatus !== undefined ? { status: mockStatus } : {}),
+    });
+  }
+
+  console(opts = {}) {
+    const { op = 'list', ...rest } = typeof opts === 'string' ? { level: opts } : opts;
+    return this.act({ op: 'console', sub: op, ...rest });
+  }
+
+  evaluate(expression, { timeoutMs = 5000 } = {}) {
+    return this.act({ op: 'evaluate', expression, timeoutMs });
+  }
+
+  inspect(target) {
+    const payload = typeof target === 'string'
+      ? (/^e\d+$/.test(target.trim()) ? { ref: target.trim() } : { selector: target })
+      : (target || {});
+    return this.act({ op: 'inspect', ...payload });
+  }
+
+  a11y(opts = {}) {
+    return this.act({ op: 'a11y', ...opts });
+  }
+
+  diff(opts = {}) {
+    const { op = 'diff', ...rest } = opts;
+    return this.act({ op: 'diff', sub: op, ...rest });
+  }
+
+  perf() {
+    return this.act({ op: 'perf' });
+  }
+
+  audit() {
+    return this.act({ op: 'audit' });
+  }
+
+  storage(opts = {}) {
+    const { op = 'inspect', ...rest } = opts;
+    return this.act({ op: 'storage', sub: op, ...rest });
+  }
+
+  security() {
+    return this.act({ op: 'security' });
+  }
+
+  emulate(opts = {}) {
+    return this.act({ op: 'emulate', ...opts });
+  }
+
+  dialog(opts = {}) {
+    const { op = 'list', ...rest } = opts;
+    return this.act({ op: 'dialog', sub: op, ...rest });
+  }
+
+  trace(opOrOpts = 'status') {
+    const { op = 'status', ...rest } = typeof opOrOpts === 'string' ? { op: opOrOpts } : (opOrOpts || {});
+    return this.act({ op: 'trace', sub: op, ...rest });
+  }
+
   // ---------- tabs & planner ----------
   async tabs(op = 'list', id, url) {
     if (op === 'list') return (await this.state()).tabs;
@@ -162,7 +233,7 @@ export class AgentBrowser {
     return answer;
   }
 
-  // ---------- governance, storage & introspection ----------
+  // ---------- governance, storageState & introspection ----------
   health() { return this.request('/api/health'); }
   tools() { return this.request('/api/tools'); }
   state() { return this.request('/api/state'); }

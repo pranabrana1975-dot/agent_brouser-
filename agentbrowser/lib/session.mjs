@@ -6,6 +6,22 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 import { takeSnapshot, toWireSnapshot } from './snapshot.mjs';
 import { extractPage } from './extract.mjs';
+import { TabDevTools, ContextNetworkControls, NETWORK_PRESETS } from './devtools.mjs';
+import {
+  DEVICE_PRESETS,
+  DEVTOOLS_INIT_SCRIPT,
+  readToasts,
+  inspectElement,
+  captureA11yTree,
+  diffSnapshots,
+  collectPerformance,
+  inspectStorage,
+  clearStorage,
+  inspectSecurity,
+  runPageAudit,
+  evaluateExpression,
+  withAnnotatedOverlay,
+} from './inspector.mjs';
 import {
   Policy,
   envFlag,
@@ -90,7 +106,15 @@ export class Session {
       : Number(process.env.AGENT_BROWSER_MAX_TABS || 12);
     this.uploadDir = opts.uploadDir ?? process.env.AGENT_BROWSER_UPLOAD_DIR ?? '';
     this.downloadDir = opts.downloadDir ?? process.env.AGENT_BROWSER_DOWNLOAD_DIR ?? '';
+    this.traceDir = opts.traceDir ?? process.env.AGENT_BROWSER_TRACE_DIR ?? '';
+    this.allowEval = typeof opts.allowEval === 'boolean'
+      ? opts.allowEval
+      : envFlag('AGENT_BROWSER_ALLOW_EVAL', false);
+    this.allowSensitiveStorage = typeof opts.allowSensitiveStorage === 'boolean'
+      ? opts.allowSensitiveStorage
+      : envFlag('AGENT_BROWSER_ALLOW_STORAGE_VALUES', false);
     this.autoCaptureOnViewers = opts.autoCaptureOnViewers !== false;
+    this.netControls = new ContextNetworkControls({ traceDir: this.traceDir });
 
     this.createdAt = Date.now();
     this.lastActiveAt = this.createdAt;
@@ -109,6 +133,8 @@ export class Session {
     this.pending = new Map();
     this.nextApproval = 1;
     this.snapshot = null;
+    this.prevSnapshot = null;
+    this.markedSnapshot = null;
     this.shotBuf = null;
     this.shotAt = 0;
     this.shotVersion = 0;
@@ -117,6 +143,7 @@ export class Session {
     this.paused = false;
     this.stats = { actions: 0, snapshots: 0, tokens: 0, htmlBytes: 0, approvals: 0, taskRuns: 0 };
     this.sessionActions = 0;
+    this.lastMutatingActionSeq = 0;
     this.lastActionAt = 0;
     this.agentStatus = 'idle';
     this.actionQueue = Promise.resolve();
@@ -216,7 +243,7 @@ export class Session {
       }
     });
 
-    // Enforce host & SSRF policy on every browser request (including redirects & subresources).
+    // Enforce host & SSRF policy first, then DevTools block rules & QA API mocks.
     await this.ctx.route('**/*', async (route) => {
       const req = route.request();
       const url = req.url();
@@ -229,12 +256,26 @@ export class Session {
         this.addLog('policy', `request refused · ${check.reason}`);
         return route.abort('blockedbyclient');
       }
+      const blockReason = this.netControls.shouldBlock(url);
+      if (blockReason) {
+        this.addLog('devtools', blockReason);
+        return route.abort('blockedbyclient');
+      }
+      const method = typeof req.method === 'function' ? req.method() : 'GET';
+      const mock = this.netControls.findMock(url, method);
+      if (mock && typeof route.fulfill === 'function') {
+        this.addLog('devtools', `mocked ${method} ${url.slice(0, 80)} → ${mock.status}`);
+        return route.fulfill({
+          status: mock.status,
+          contentType: mock.contentType,
+          headers: mock.headers,
+          body: mock.body,
+        });
+      }
       return route.continue();
     });
 
-    await this.ctx.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
+    await this.ctx.addInitScript(DEVTOOLS_INIT_SCRIPT);
 
     await this._openNewTab('about:blank');
     this.addLog('sys', `session "${this.id}" up · Chromium ${version} · viewport ${this.viewport.width}×${this.viewport.height}`);
@@ -266,13 +307,15 @@ export class Session {
     }
 
     const id = 't' + this.nextTab++;
-    const tab = { id, page, title: '', createdAt: Date.now() };
-    this.tabs.push(tab);
-
-    page.on?.('dialog', async (d) => {
-      this.addLog('policy', `dialog auto-dismissed (${d.type()}): ${String(d.message()).slice(0, 120)}`);
-      try { await d.dismiss(); } catch {}
+    const devtools = new TabDevTools(page, {
+      getActionSeq: () => this.stats.actions,
+      onDialogEvent: (rec) => {
+        this.addLog('policy', `dialog ${rec.action} (${rec.type}): ${rec.message.slice(0, 120)}`);
+        this.emit('dialog', { tabId: id, dialog: rec });
+      },
     });
+    const tab = { id, page, title: '', createdAt: Date.now(), devtools };
+    this.tabs.push(tab);
 
     page.on?.('framenavigated', (f) => {
       const isMain = typeof page.mainFrame === 'function' ? f === page.mainFrame() : true;
@@ -291,11 +334,14 @@ export class Session {
     });
 
     page.on?.('close', () => {
+      void devtools.detach();
       const idx = this.tabs.findIndex((x) => x.id === id);
       if (idx >= 0) this.tabs.splice(idx, 1);
       if (this.activeId === id) {
         this.activeId = this.tabs[this.tabs.length - 1]?.id || null;
         this.snapshot = null;
+        this.prevSnapshot = null;
+        this.markedSnapshot = null;
         this.shotBuf = null;
         this._clearFormTaint();
       }
@@ -305,6 +351,8 @@ export class Session {
     if (activate) {
       this.activeId = id;
       this.snapshot = null;
+      this.prevSnapshot = null;
+      this.markedSnapshot = null;
       this.shotBuf = null;
       this._clearFormTaint();
     }
@@ -393,6 +441,8 @@ export class Session {
         if (wasActive) {
           this.activeId = this.tabs[this.tabs.length - 1]?.id || null;
           this.snapshot = null;
+          this.prevSnapshot = null;
+          this.markedSnapshot = null;
           this.shotBuf = null;
           this._clearFormTaint();
           if (this.activeId) await this.snap();
@@ -402,6 +452,8 @@ export class Session {
         if (!this.tabs.some((t) => t.id === id)) throw new Error(`unknown tab: ${id}`);
         this.activeId = id;
         this.snapshot = null;
+        this.prevSnapshot = null;
+        this.markedSnapshot = null;
         this.shotBuf = null;
         this._clearFormTaint();
         await this.snap();
@@ -439,13 +491,22 @@ export class Session {
     });
   }
 
-  async capture({ fullPage = false, quality = 65 } = {}) {
+  async capture({ fullPage = false, quality = 65, annotate = false } = {}) {
     await this.init();
     const page = this.active();
     if (!page) throw new Error('no active tab');
     const q = Math.min(95, Math.max(20, Math.trunc(Number(quality) || 65)));
-    const buf = await page.screenshot({ type: 'jpeg', quality: q, fullPage: Boolean(fullPage), timeout: 10000 });
-    this.shotBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    if (annotate && !this.snapshot) {
+      await this.snap();
+    }
+    const doShot = async () => {
+      const buf = await page.screenshot({ type: 'jpeg', quality: q, fullPage: Boolean(fullPage), timeout: 10000 });
+      return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    };
+    const buf = annotate
+      ? await withAnnotatedOverlay(page, this.snapshot?.boxes || [], doShot)
+      : await doShot();
+    this.shotBuf = buf;
     this.shotAt = Date.now();
     this.shotVersion++;
     this.emit('shot', { v: this.shotVersion, at: this.shotAt });
@@ -455,11 +516,18 @@ export class Session {
   async snap(opts = {}) {
     const tab = this.activeTab();
     if (!tab) return null;
+    let devtoolsBadge = '';
+    if (tab.devtools) {
+      const toasts = await readToasts(tab.page, { clear: false });
+      const toastCount = Array.isArray(toasts) ? toasts.length : 0;
+      devtoolsBadge = tab.devtools.badgeSummary({ toastCount });
+    }
     const probeOpts = typeof opts === 'number'
-      ? { startRef: opts }
-      : { startRef: this.nextRef, ...(opts || {}) };
+      ? { startRef: opts, devtoolsBadge }
+      : { startRef: this.nextRef, devtoolsBadge, ...(opts || {}) };
     const s = await takeSnapshot(tab.page, probeOpts);
     this.nextRef += s.boxes.length;
+    if (this.snapshot) this.prevSnapshot = this.snapshot;
     this.snapshot = s;
     if (s.meta?.title !== undefined) tab.title = s.meta.title;
     this.stats.snapshots++;
@@ -505,12 +573,42 @@ export class Session {
         expiresAt: p.expiresAt,
       })),
       downloads: this.downloads.slice(-20),
+      devtools: this.devtoolsOverview(),
       stats: { ...this.stats },
       policy: this.policy.toJSON(),
       agentStatus: this.agentStatus,
       paused: this.paused,
       createdAt: this.createdAt,
       lastActiveAt: this.lastActiveAt,
+    };
+  }
+
+  devtoolsOverview() {
+    const dt = this.activeTab()?.devtools || null;
+    return {
+      console: dt ? {
+        total: dt.console.length,
+        errors: dt.console.filter((c) => c.level === 'error' || c.level === 'pageerror').length,
+        warnings: dt.console.filter((c) => c.level === 'warning').length,
+      } : { total: 0, errors: 0, warnings: 0 },
+      network: dt ? {
+        total: dt.requests.length,
+        failed: dt.requests.filter((r) => r.failed).length,
+        websockets: dt.websockets.length,
+        wsFrames: dt.wsFrames.length,
+        mocks: this.netControls.mocks.length,
+        blockTrackers: this.netControls.blockTrackers,
+        blockedPatterns: this.netControls.blockedPatterns.length,
+        profile: this.netControls.networkProfile,
+      } : { total: 0, failed: 0, websockets: 0, wsFrames: 0, mocks: 0, blockTrackers: false, blockedPatterns: 0 },
+      dialogs: dt ? {
+        total: dt.dialogs.length,
+        mode: dt.dialogRule.mode,
+        pending: dt.pendingDialog ? dt.pendingDialog.record : null,
+      } : { total: 0, mode: 'dismiss', pending: null },
+      emulation: { ...this.netControls.emulation },
+      trace: this.netControls.traceStatus(),
+      allowEval: this.allowEval,
     };
   }
 
@@ -701,10 +799,18 @@ export class Session {
     await this.init();
     await this.waitPause(gen);
     await this.throttle();
-    const page = this.active();
+    const tab = this.activeTab();
+    const page = tab?.page || null;
     if (!page) throw new Error('no active tab');
     this.stats.actions++;
     this.sessionActions++;
+    const READONLY_OPS = new Set([
+      'snapshot', 'extract', 'read', 'screenshot', 'network', 'console',
+      'inspect', 'a11y', 'diff', 'perf', 'audit', 'security', 'trace',
+    ]);
+    if (!READONLY_OPS.has(a.op)) {
+      this.lastMutatingActionSeq = this.stats.actions;
+    }
 
     const wireOpts = { full: a.compact ? false : a.full !== false, includeBody: Boolean(a.includeBody) };
 
@@ -1018,11 +1124,11 @@ export class Session {
 
       case 'screenshot': {
         const imgType = a.type === 'jpeg' ? 'jpeg' : 'png';
-        this.addLog('act', `screenshot (${imgType}${a.fullPage ? ', fullPage' : ''})`);
+        const annotate = Boolean(a.annotate);
+        this.addLog('act', `screenshot (${imgType}${annotate ? ', annotated' : ''}${a.fullPage ? ', fullPage' : ''})`);
         try {
           if (imgType === 'jpeg') {
-            const buf = await this.capture({ fullPage: Boolean(a.fullPage), quality: a.quality });
-            const tab = this.activeTab();
+            const buf = await this.capture({ fullPage: Boolean(a.fullPage), quality: a.quality, annotate });
             const base64 = buf.toString('base64');
             return {
               ok: true,
@@ -1030,6 +1136,7 @@ export class Session {
                 mimeType: 'image/jpeg',
                 base64,
                 bytes: buf.length,
+                annotated: annotate,
                 shotVersion: this.shotVersion,
                 shotAt: this.shotAt,
                 url: tab?.page?.url?.() || '',
@@ -1037,21 +1144,431 @@ export class Session {
               },
             };
           }
-          const raw = await page.screenshot({ type: 'png', fullPage: Boolean(a.fullPage), timeout: 10000 });
-          const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-          const tab = this.activeTab();
+          if (annotate && !this.snapshot) await this.snap();
+          const takePng = async () => {
+            const raw = await page.screenshot({ type: 'png', fullPage: Boolean(a.fullPage), timeout: 10000 });
+            return Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+          };
+          const buf = annotate
+            ? await withAnnotatedOverlay(page, this.snapshot?.boxes || [], takePng)
+            : await takePng();
           return {
             ok: true,
             data: {
               mimeType: 'image/png',
               base64: buf.toString('base64'),
               bytes: buf.length,
+              annotated: annotate,
               url: tab?.page?.url?.() || '',
               title: tab?.title || '',
             },
           };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
+        }
+      }
+
+      // ---------------- F12 Agent DevTools actions ----------------
+      case 'network': {
+        const dt = tab.devtools;
+        const sub = String(a.sub || a.mode || 'list').toLowerCase();
+        try {
+          if (sub === 'list') {
+            const sinceActionSeq = a.sinceLastAction ? this.lastMutatingActionSeq : null;
+            return {
+              ok: true,
+              data: dt.listNetwork({
+                resourceType: a.resourceType,
+                status: a.status,
+                url: a.url,
+                sinceActionSeq,
+                limit: a.limit,
+              }),
+            };
+          }
+          if (sub === 'get') {
+            if (!a.id) return { error: 'request id required (e.g. r1)' };
+            const entry = dt.getNetworkEntry(a.id, { maxChars: a.maxChars });
+            if (!entry) return { error: `unknown request id: ${a.id}` };
+            return { ok: true, data: entry };
+          }
+          if (sub === 'websockets') {
+            return { ok: true, data: dt.listWebSockets({ wsId: a.wsId, limit: a.limit }) };
+          }
+          if (sub === 'har') {
+            return { ok: true, data: dt.exportHar({ includeBodies: Boolean(a.includeBodies) }) };
+          }
+          if (sub === 'clear') {
+            dt.clearNetwork();
+            this.addLog('devtools', 'network log cleared');
+            return { ok: true, data: { cleared: true } };
+          }
+          if (sub === 'throttle') {
+            const presetName = a.preset ? String(a.preset).toLowerCase() : '';
+            const profileInput = presetName
+              ? presetName
+              : {
+                  offline: Boolean(a.offline),
+                  latencyMs: a.latencyMs ?? 0,
+                  downloadKbps: a.downloadKbps ?? -1,
+                  uploadKbps: a.uploadKbps ?? -1,
+                };
+            if (presetName && !NETWORK_PRESETS[presetName]) {
+              return { error: `unknown throttle preset: ${presetName}` };
+            }
+            const applied = await dt.applyNetworkThrottle(this.ctx, profileInput);
+            this.netControls.networkProfile = { ...applied, preset: presetName || 'custom' };
+            this.netControls.emulation.offline = applied.offline;
+            this.addLog('devtools', `network throttle → ${presetName || JSON.stringify(applied)}`);
+            return { ok: true, data: this.netControls.networkProfile };
+          }
+          if (sub === 'block') {
+            const updated = this.netControls.setBlocked({ patterns: a.patterns, blockTrackers: a.blockTrackers });
+            this.addLog('devtools', `network block updated · trackers=${updated.blockTrackers} · patterns=${updated.blockedPatterns.length}`);
+            return { ok: true, data: updated };
+          }
+          if (sub === 'mock') {
+            const added = this.netControls.addMock({
+              urlPattern: a.urlPattern,
+              method: a.method,
+              status: a.status,
+              contentType: a.contentType,
+              body: a.body,
+              headers: a.headers,
+            });
+            this.addLog('devtools', `network mock added · ${added.method} ${added.urlPattern} → ${added.status}`);
+            return { ok: true, data: added };
+          }
+          if (sub === 'unmock') {
+            const cleared = this.netControls.clearMocks(a.id);
+            this.addLog('devtools', `network mocks cleared · removed=${cleared.removed}`);
+            return { ok: true, data: cleared };
+          }
+          return { error: `unknown network operation: ${sub}` };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'console': {
+        const dt = tab.devtools;
+        const sub = String(a.sub || a.mode || 'list').toLowerCase();
+        if (sub === 'clear') {
+          dt.clearConsole();
+          this.addLog('devtools', 'console log cleared');
+          return { ok: true, data: { cleared: true } };
+        }
+        if (sub !== 'list') return { error: `unknown console operation: ${sub}` };
+        const sinceActionSeq = a.sinceLastAction ? this.lastMutatingActionSeq : null;
+        return {
+          ok: true,
+          data: dt.listConsole({
+            level: a.level,
+            search: a.search,
+            sinceActionSeq,
+            limit: a.limit,
+          }),
+        };
+      }
+
+      case 'evaluate': {
+        if (!this.allowEval) {
+          return {
+            blocked: true,
+            reason: 'browser_evaluate is disabled by default (set AGENT_BROWSER_ALLOW_EVAL=1 for trusted debugging)',
+          };
+        }
+        const expression = String(a.expression || '').trim();
+        if (!expression) return { error: 'expression required' };
+        if (this.policy.approvalsEnabled) {
+          const decision = await this.requestApproval({
+            reason: 'page JavaScript execution',
+            detail: `evaluate JS: ${expression.slice(0, 90)}`,
+            rule: 'evaluate',
+          });
+          if (!decision.allow) return { blocked: true, reason: decision.reason };
+        }
+        this.addLog('devtools', `evaluate JS (${expression.length} chars)`);
+        try {
+          const data = await evaluateExpression(page, expression, { timeoutMs: a.timeoutMs });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 200) };
+        }
+      }
+
+      case 'inspect': {
+        let ref = a.ref ? String(a.ref).trim() : '';
+        const selector = a.selector ? String(a.selector).trim() : '';
+        if (!ref && !selector) return { error: 'provide ref (e.g. e3) or CSS selector' };
+        if (selector.length > 1000) return { error: 'selector too long' };
+        let frame = '';
+        if (ref) {
+          const box = this._findBox(ref);
+          if (!box) return { blocked: true, reason: `unknown ref ${ref} — take a snapshot first` };
+          frame = box.frame || '';
+        }
+        this.addLog('devtools', `inspect ${ref || selector.slice(0, 60)}`);
+        try {
+          const data = await inspectElement(page, { ref, selector, frame });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'a11y': {
+        const ref = a.ref ? String(a.ref).trim() : '';
+        const selector = a.selector ? String(a.selector).trim() : '';
+        let locator = null;
+        if (ref) {
+          const box = this._findBox(ref);
+          if (!box) return { blocked: true, reason: `unknown ref ${ref} — take a snapshot first` };
+          locator = this._locatorFor(page, box);
+        }
+        this.addLog('devtools', `a11y tree ${ref || selector || 'document'}`);
+        try {
+          const data = await captureA11yTree(page, { locator, ref, selector, maxChars: a.maxChars });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'diff': {
+        const sub = String(a.sub || a.mode || 'diff').toLowerCase();
+        if (sub === 'mark') {
+          const snap = this.snapshot || (await this.snap());
+          this.markedSnapshot = snap;
+          await readToasts(page, { clear: true });
+          this.addLog('devtools', 'diff checkpoint marked');
+          return { ok: true, data: { marked: true, url: snap?.meta?.url || '', controls: snap?.boxes?.length || 0 } };
+        }
+        const before = a.sinceMark && this.markedSnapshot ? this.markedSnapshot : this.prevSnapshot;
+        const fresh = a.refresh ? await this.snap() : (this.snapshot || (await this.snap()));
+        const baseline = a.refresh && !a.sinceMark ? this.prevSnapshot : before;
+        const rawToasts = await readToasts(page, { clear: Boolean(a.clearToasts) });
+        const toasts = Array.isArray(rawToasts) ? rawToasts : [];
+        return { ok: true, data: diffSnapshots(baseline, fresh, toasts) };
+      }
+
+      case 'perf': {
+        this.addLog('devtools', 'collect performance metrics');
+        try {
+          const cdp = await tab.devtools.ensureCdp(this.ctx);
+          const data = await collectPerformance(page, { cdp });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'audit': {
+        this.addLog('devtools', 'run page audit');
+        try {
+          const cdp = await tab.devtools.ensureCdp(this.ctx);
+          const data = await runPageAudit(page, { tabDevtools: tab.devtools, cdp });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'storage': {
+        const sub = String(a.sub || a.mode || 'inspect').toLowerCase();
+        try {
+          if (sub === 'clear') {
+            if (this.policy.approvalsEnabled) {
+              const decision = await this.requestApproval({
+                reason: 'clear browser storage/cookies',
+                detail: `clear storage [${(a.targets || ['cookies', 'localStorage', 'sessionStorage']).join(', ')}]`,
+                rule: 'destructive',
+              });
+              if (!decision.allow) return { blocked: true, reason: decision.reason };
+            }
+            const res = await clearStorage(page, this.ctx, a.targets);
+            this.addLog('devtools', `storage cleared · [${res.cleared.join(', ')}]`);
+            return { ok: true, data: res };
+          }
+          if (sub !== 'inspect') return { error: `unknown storage operation: ${sub}` };
+          const includeValues = Boolean(a.includeValues && this.allowSensitiveStorage);
+          const data = await inspectStorage(page, this.ctx, { includeValues });
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'security': {
+        this.addLog('devtools', 'inspect page security & third-party requests');
+        try {
+          const data = await inspectSecurity(page, this.ctx, tab.devtools);
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'emulate': {
+        try {
+          const emu = this.netControls.emulation;
+          let targetViewport = null;
+          let targetUa = a.userAgent !== undefined ? String(a.userAgent) : null;
+          let deviceScaleFactor = 1;
+          let mobile = false;
+
+          if (a.device) {
+            const preset = DEVICE_PRESETS[String(a.device).toLowerCase()];
+            if (!preset) return { error: `unknown device preset: ${a.device} (use ${Object.keys(DEVICE_PRESETS).join(', ')})` };
+            emu.device = preset.name;
+            targetViewport = { ...preset.viewport };
+            deviceScaleFactor = preset.deviceScaleFactor;
+            mobile = preset.mobile;
+            if (targetUa === null && preset.userAgent) targetUa = preset.userAgent;
+          }
+
+          if (a.viewport && typeof a.viewport === 'object') {
+            targetViewport = parseViewport(a.viewport);
+            if (!a.device) emu.device = 'custom';
+          } else if (Number.isFinite(a.width) && Number.isFinite(a.height)) {
+            targetViewport = parseViewport({ width: a.width, height: a.height });
+            if (!a.device) emu.device = 'custom';
+          }
+
+          if (targetViewport) {
+            await page.setViewportSize?.(targetViewport);
+            this.viewport = targetViewport;
+            emu.viewport = targetViewport;
+          }
+
+          const cdp = await tab.devtools.ensureCdp(this.ctx);
+          if (cdp && (a.device || targetUa !== null || a.timezoneId)) {
+            if (a.device && targetViewport) {
+              await cdp.send('Emulation.setDeviceMetricsOverride', {
+                width: targetViewport.width,
+                height: targetViewport.height,
+                deviceScaleFactor,
+                mobile,
+              }).catch(() => {});
+              await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: mobile }).catch(() => {});
+            }
+            if (targetUa !== null && targetUa !== '') {
+              await cdp.send('Emulation.setUserAgentOverride', { userAgent: targetUa }).catch(() => {});
+            }
+            if (a.timezoneId) {
+              const tz = String(a.timezoneId).trim();
+              if (!/^[A-Za-z0-9_/+.-]{2,64}$/.test(tz)) return { error: 'invalid timezoneId' };
+              await cdp.send('Emulation.setTimezoneOverride', { timezoneId: tz });
+              emu.timezoneId = tz;
+            }
+          }
+
+          const mediaPatch = {};
+          if (a.colorScheme) {
+            if (!['light', 'dark', 'no-preference'].includes(a.colorScheme)) return { error: 'invalid colorScheme' };
+            mediaPatch.colorScheme = a.colorScheme;
+            emu.colorScheme = a.colorScheme;
+          }
+          if (a.reducedMotion) {
+            if (!['reduce', 'no-preference'].includes(a.reducedMotion)) return { error: 'invalid reducedMotion' };
+            mediaPatch.reducedMotion = a.reducedMotion;
+            emu.reducedMotion = a.reducedMotion;
+          }
+          if (a.media) {
+            if (!['screen', 'print'].includes(a.media)) return { error: 'invalid media type' };
+            mediaPatch.media = a.media;
+            emu.media = a.media;
+          }
+          if (Object.keys(mediaPatch).length) {
+            await page.emulateMedia?.(mediaPatch);
+          }
+
+          if (typeof a.offline === 'boolean') {
+            await this.ctx.setOffline?.(a.offline);
+            emu.offline = a.offline;
+            this.netControls.networkProfile.offline = a.offline;
+          }
+
+          if (a.geolocation && typeof a.geolocation === 'object') {
+            const lat = Number(a.geolocation.latitude);
+            const lng = Number(a.geolocation.longitude);
+            const acc = a.geolocation.accuracy !== undefined ? Math.max(0, Number(a.geolocation.accuracy)) : 50;
+            if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+              return { error: 'invalid geolocation coordinates' };
+            }
+            await this.ctx.grantPermissions?.(['geolocation']).catch(() => {});
+            await this.ctx.setGeolocation?.({ latitude: lat, longitude: lng, accuracy: acc });
+            emu.geolocation = { latitude: lat, longitude: lng, accuracy: acc };
+          }
+
+          this.addLog('devtools', `emulate updated · device=${emu.device || 'default'} · ${this.viewport.width}×${this.viewport.height} · ${emu.colorScheme}`);
+          const snap = await this.snap();
+          return { ok: true, data: { emulation: { ...emu, viewport: this.viewport }, snapshot: toWireSnapshot(snap, wireOpts) } };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
+        }
+      }
+
+      case 'dialog': {
+        const dt = tab.devtools;
+        const sub = String(a.sub || a.mode || 'list').toLowerCase();
+        if (sub === 'list') {
+          return {
+            ok: true,
+            data: {
+              rule: { ...dt.dialogRule },
+              pending: dt.pendingDialog ? dt.pendingDialog.record : null,
+              dialogs: [...dt.dialogs],
+            },
+          };
+        }
+        if (sub === 'set') {
+          const action = String(a.action || 'dismiss').toLowerCase();
+          if (!['accept', 'dismiss', 'manual'].includes(action)) {
+            return { error: 'dialog action must be accept, dismiss, or manual' };
+          }
+          dt.dialogRule = {
+            mode: action,
+            promptText: a.promptText !== undefined ? String(a.promptText) : '',
+            once: Boolean(a.once),
+          };
+          this.addLog('devtools', `dialog rule → ${action}${dt.dialogRule.once ? ' (once)' : ''}`);
+          return { ok: true, data: { rule: { ...dt.dialogRule } } };
+        }
+        if (sub === 'accept' || sub === 'dismiss') {
+          if (!dt.pendingDialog) return { error: 'no pending dialog' };
+          const id = dt.pendingDialog.id;
+          await dt.pendingDialog.decide(sub === 'accept', a.promptText);
+          return { ok: true, data: { id, action: sub === 'accept' ? 'accepted' : 'dismissed' } };
+        }
+        if (sub === 'clear') {
+          dt.dialogs = [];
+          return { ok: true, data: { cleared: true } };
+        }
+        return { error: `unknown dialog operation: ${sub}` };
+      }
+
+      case 'trace': {
+        const sub = String(a.sub || a.mode || 'status').toLowerCase();
+        try {
+          if (sub === 'status') return { ok: true, data: this.netControls.traceStatus() };
+          if (sub === 'start') {
+            const started = await this.netControls.startTrace(this.ctx, {
+              screenshots: a.screenshots !== false,
+              snapshots: a.snapshots !== false,
+              sources: Boolean(a.sources),
+            });
+            this.addLog('devtools', 'Playwright trace recording started');
+            return { ok: true, data: started };
+          }
+          if (sub === 'stop') {
+            const stopped = await this.netControls.stopTrace(this.ctx, this.id);
+            this.addLog('devtools', `Playwright trace saved → ${stopped.path} (${stopped.bytes} bytes)`);
+            return { ok: true, data: stopped };
+          }
+          return { error: `unknown trace operation: ${sub}` };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
         }
       }
 
@@ -1276,6 +1793,8 @@ export class Session {
       await this._teardown();
       this.nextRef = 0;
       this.sessionActions = 0;
+      this.lastMutatingActionSeq = 0;
+      this.netControls = new ContextNetworkControls({ traceDir: this.traceDir });
       this.stats = { actions: 0, snapshots: 0, tokens: 0, htmlBytes: 0, approvals: 0, taskRuns: 0 };
       this.downloads = [];
       this.agentStatus = 'idle';
@@ -1291,12 +1810,19 @@ export class Session {
   async _teardown() {
     const ctx = this.ctx;
     const browser = this.browser;
+    const oldTabs = this.tabs;
     this.ctx = null;
     this.tabs = [];
     this.activeId = null;
     this.snapshot = null;
+    this.prevSnapshot = null;
+    this.markedSnapshot = null;
     this.shotBuf = null;
     this.shotAt = 0;
+    for (const t of oldTabs) {
+      try { await t.devtools?.detach?.(); } catch {}
+    }
+    this.netControls.traceActive = false;
     try { await ctx?.close(); } catch {}
     if (this._ownsBrowser && browser) {
       this.browser = null;

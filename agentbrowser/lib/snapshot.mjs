@@ -552,11 +552,14 @@ function formatFlags(nd) {
   return flags;
 }
 
-export function renderDoc(raw) {
+export function renderDoc(raw, { devtoolsBadge = '' } = {}) {
   const lines = [];
   lines.push(`[url] ${raw.url}`);
   lines.push(`[title] ${raw.title}`);
   lines.push(`[viewport] ${raw.vw}x${raw.vh}  scrollY=${raw.scrollY}/${Math.max(0, raw.docHeight - raw.vh)}`);
+  if (devtoolsBadge) {
+    lines.push(`[devtools] ${devtoolsBadge}`);
+  }
   if (raw.truncatedActions > 0) {
     lines.push(`[actions] showing ${raw.nodes.filter((nd) => nd.ref).length} of ${raw.totalActions} (${raw.truncatedActions} lower-priority controls omitted)`);
   }
@@ -603,6 +606,7 @@ export function renderDoc(raw) {
       v: nd.inViewport,
     };
     if (nd.frame) box.frame = nd.frame;
+    if (nd.value) box.value = nd.value;
     if (nd.inputType) box.inputType = nd.inputType;
     if (nd.href) box.href = nd.href;
     if (nd.disabled) box.disabled = true;
@@ -651,6 +655,9 @@ export function toWireSnapshot(snap, { full = true, includeBody = false } = {}) 
 }
 
 export async function takeSnapshot(page, startRefOrOpts = 0) {
+  const devtoolsBadge = typeof startRefOrOpts === 'object' && startRefOrOpts
+    ? String(startRefOrOpts.devtoolsBadge || '')
+    : '';
   const raw = await page.evaluate(PAGE_PROBE, startRefOrOpts);
-  return renderDoc(raw);
+  return renderDoc(raw, { devtoolsBadge });
 }
