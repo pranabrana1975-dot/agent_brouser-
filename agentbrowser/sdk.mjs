@@ -75,7 +75,7 @@ export class AgentBrowser {
 
   async act(action, reqOpts) {
     const result = await this._actRaw(action, reqOpts);
-    return result?.snapshot ?? null;
+    return result?.data ?? result?.snapshot ?? null;
   }
 
   // ---------- page & element actions ----------
@@ -116,18 +116,27 @@ export class AgentBrowser {
     return this.act({ op: 'wait', text, selector, url, state, timeoutMs, compact }, { timeoutMs: reqTimeout });
   }
 
+  waitFor(selector, timeoutMs = 10000) {
+    return this.wait({ selector, timeoutMs });
+  }
+
+  extract(format = 'text', maxChars = 20000) {
+    return this.act({ op: 'extract', format, maxChars });
+  }
+
   async read({ maxChars = 20000 } = {}) {
     const res = await this._actRaw({ op: 'read', maxChars });
     return res?.article ?? { title: '', url: '', text: '', length: 0, truncated: false };
   }
 
-  async screenshot({ fullPage = false, quality, encoding = 'buffer' } = {}) {
-    const res = await this._actRaw({ op: 'screenshot', fullPage, quality });
-    const shot = res?.screenshot;
-    if (!shot?.data) throw new Error('screenshot capture failed');
-    if (encoding === 'raw' || encoding === 'object') return shot;
-    if (encoding === 'base64') return shot.data;
-    return Buffer.from(shot.data, 'base64');
+  async screenshot({ fullPage = false, type = 'png', quality, encoding = 'object' } = {}) {
+    const res = await this._actRaw({ op: 'screenshot', fullPage, type, quality });
+    const shot = res?.data ?? res?.screenshot;
+    const b64 = shot?.base64 ?? shot?.data;
+    if (!b64) throw new Error('screenshot capture failed');
+    if (encoding === 'buffer') return Buffer.from(b64, 'base64');
+    if (encoding === 'base64') return b64;
+    return { ...shot, mimeType: shot.mimeType || `image/${type}`, base64: b64 };
   }
 
   upload(ref, paths, { compact } = {}) {

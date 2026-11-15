@@ -213,3 +213,40 @@ test('MCP advertises tools and handles JSON-RPC errors over stdio without an HTT
   assert.equal(responses[3].error.code, -32601);
   assert.equal(responses[4].error.code, -32700);
 });
+
+test('MCP rejects invalid tool arguments before contacting the browser', async () => {
+  const child = spawn(process.execPath, ['mcp.mjs'], { cwd: new URL('..', import.meta.url), stdio: ['pipe', 'pipe', 'pipe'] });
+  const output = [];
+  child.stdout.on('data', x => output.push(x));
+  child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'browser_open', arguments: {} } }) + '\n');
+  await new Promise(resolve => child.on('close', resolve));
+  const result = JSON.parse(Buffer.concat(output).toString()).result;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Missing argument: url/);
+});
+
+test('MCP bridges extraction and screenshots to HTTP with token', async () => {
+  const http = await import('node:http');
+  const server = http.createServer(async (req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer test-token');
+    let body = ''; for await (const chunk of req) body += chunk;
+    const action = JSON.parse(body);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ ok: true, result: { data: action.op === 'screenshot' ? { mimeType: 'image/png', base64: 'aGVsbG8=' } : { format: action.format, content: 'hello' } } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const child = spawn(process.execPath, ['mcp.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, AGENT_BROWSER_URL: `http://127.0.0.1:${server.address().port}`, AGENT_BROWSER_TOKEN: 'test-token' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const output = [];
+    child.stdout.on('data', x => output.push(x));
+    child.stdin.end([
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_extract', arguments: { format: 'markdown' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_screenshot', arguments: {} } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(await new Promise(resolve => child.on('close', resolve)), 0);
+    const responses = Buffer.concat(output).toString().trim().split('\n').map(JSON.parse);
+    const get = id => responses.find(r => r.id === id).result.content[0];
+    assert.equal(JSON.parse(get(1).text).content, 'hello');
+    assert.deepEqual(get(2), { type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' });
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});

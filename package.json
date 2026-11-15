@@ -11,6 +11,7 @@
     "start": "npm --prefix agentbrowser start",
     "mcp": "npm --prefix agentbrowser run mcp",
     "mcp:embedded": "npm --prefix agentbrowser run mcp:embedded",
+    "fetch": "node agentbrowser/cli.mjs fetch",
     "test": "npm --prefix agentbrowser test",
     "test:e2e": "npm --prefix agentbrowser run test:e2e"
   },

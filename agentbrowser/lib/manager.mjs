@@ -64,8 +64,12 @@ export class SessionManager {
     if (this._browserPromise) return this._browserPromise;
 
     this._browserPromise = (async () => {
-      const { headless, args } = this._launchOpts;
-      const b = await this._browserLauncher({ headless, args });
+      const { headless, args, executablePath } = this._launchOpts;
+      const b = await this._browserLauncher({
+        headless,
+        args,
+        ...(executablePath ? { executablePath } : {}),
+      });
       b.on?.('disconnected', () => {
         if (this.browser === b) this.browser = null;
         for (const s of this.sessions.values()) {

@@ -1,9 +1,12 @@
 {
   "name": "agentbrowser",
   "version": "1.1.0",
-  "description": "Headless browser control plane, JavaScript SDK, and MCP tools for AI agents",
+  "description": "Headless browser control plane, CLI, JavaScript SDK, and MCP tools for AI agents",
   "type": "module",
   "main": "server.mjs",
+  "bin": {
+    "agentbrowser": "./cli.mjs"
+  },
   "exports": {
     ".": "./sdk.mjs",
     "./sdk": "./sdk.mjs",
@@ -18,12 +21,17 @@
     "start": "node server.mjs",
     "mcp": "node mcp.mjs",
     "mcp:embedded": "node mcp.mjs --embedded",
-    "test": "node --test test/core.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs test/e2e.test.mjs",
-    "test:unit": "node --test test/core.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs",
-    "test:e2e": "node --test test/e2e.test.mjs"
+    "fetch": "node cli.mjs fetch",
+    "test": "node --test",
+    "test:unit": "node --test test/core.test.mjs test/extract.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs",
+    "test:e2e": "node --test test/e2e.test.mjs test/browser.integration.test.mjs"
   },
   "dependencies": {
-    "playwright": "^1.65.1"
+    "playwright": "^1.65.1",
+    "turndown": "^7.2.5"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
   },
   "license": "MIT"
 }

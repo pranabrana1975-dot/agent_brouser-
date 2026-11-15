@@ -5,7 +5,11 @@
 // in active modals, the current viewport, and <main>/<article>/<form> are
 // prioritized so large navigation headers never crowd out real page actions.
 
-export const PAGE_PROBE = (opts = {}) => {
+export const PAGE_PROBE = (rawOpts = 0) => {
+  const opts = typeof rawOpts === 'number'
+    ? { startRef: rawOpts }
+    : (rawOpts && typeof rawOpts === 'object' ? rawOpts : {});
+  const START_REF = Number.isInteger(opts.startRef) && opts.startRef >= 0 ? opts.startRef : 0;
   const MAX_ACTIONS = opts.maxActions || 100;
   const MAX_HEADINGS = opts.maxHeadings || 14;
   const MAX_TEXT = opts.maxText || 14;
@@ -74,13 +78,17 @@ export const PAGE_PROBE = (opts = {}) => {
     const tag = (el.tagName || '').toUpperCase();
     const isIntrinsicControl = ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'IFRAME', 'DIALOG'].includes(tag);
     if (!allowFullScreen && !isIntrinsicControl && r.width >= vw && r.height >= vh) return null;
+    const left = Number.isFinite(r.left) ? r.left : (r.x || 0);
+    const top = Number.isFinite(r.top) ? r.top : (r.y || 0);
+    const right = Number.isFinite(r.right) ? r.right : left + r.width;
+    const bottom = Number.isFinite(r.bottom) ? r.bottom : top + r.height;
     return {
-      x: r.left + offset.x,
-      y: r.top + offset.y,
-      left: r.left + offset.x,
-      top: r.top + offset.y,
-      right: r.right + offset.x,
-      bottom: r.bottom + offset.y,
+      x: left + offset.x,
+      y: top + offset.y,
+      left: left + offset.x,
+      top: top + offset.y,
+      right: right + offset.x,
+      bottom: bottom + offset.y,
       width: r.width,
       height: r.height,
     };
@@ -418,7 +426,7 @@ export const PAGE_PROBE = (opts = {}) => {
     .sort((a, b) => (Number(b.inModal) - Number(a.inModal)) || (a.order - b.order));
 
   const nodes = [];
-  let refSeq = 0;
+  let refSeq = START_REF;
   for (const c of chosenActions) {
     const ref = 'e' + ++refSeq;
     try { c.el.setAttribute('data-agent-ref', ref); } catch {}
@@ -642,7 +650,7 @@ export function toWireSnapshot(snap, { full = true, includeBody = false } = {}) 
   return out;
 }
 
-export async function takeSnapshot(page, opts = {}) {
-  const raw = await page.evaluate(PAGE_PROBE, opts);
+export async function takeSnapshot(page, startRefOrOpts = 0) {
+  const raw = await page.evaluate(PAGE_PROBE, startRefOrOpts);
   return renderDoc(raw);
 }

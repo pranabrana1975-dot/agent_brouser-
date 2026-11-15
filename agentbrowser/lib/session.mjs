@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { takeSnapshot, toWireSnapshot } from './snapshot.mjs';
+import { extractPage } from './extract.mjs';
 import {
   Policy,
   envFlag,
@@ -14,7 +15,7 @@ import {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const REF_RE = /^e\d{1,4}$/;
+const REF_RE = /^e\d{1,8}$/;
 const FRAME_RE = /^f\d{1,3}$/;
 const SAFE_KEY_RE = /^[a-zA-Z0-9+_.:-]{1,40}$/;
 
@@ -50,13 +51,19 @@ export function defaultLaunchOptions(opts = {}) {
   const headless = typeof opts.headless === 'boolean'
     ? opts.headless
     : envFlag('AGENT_BROWSER_HEADLESS', true);
+  const executablePath = opts.executablePath ?? process.env.CHROMIUM_EXECUTABLE_PATH ?? '';
   const args = [
     '--disable-dev-shm-usage',
     '--disable-blink-features=AutomationControlled',
     '--disable-gpu',
   ];
   if (noSandbox) args.unshift('--no-sandbox', '--disable-setuid-sandbox');
-  return { headless, args, noSandbox };
+  return {
+    headless,
+    args,
+    noSandbox,
+    ...(executablePath ? { executablePath } : {}),
+  };
 }
 
 export class Session {
@@ -94,6 +101,7 @@ export class Session {
     this._knownPages = new WeakSet();
     this.activeId = null;
     this.nextTab = 1;
+    this.nextRef = 0;
     this.log = [];
     this.nextLog = 1;
     this.listeners = new Set();
@@ -163,8 +171,12 @@ export class Session {
     if (this._getBrowser) {
       this.browser = await this._getBrowser();
     } else {
-      const { headless, args, noSandbox } = this._launchOpts;
-      this.browser = await this._browserLauncher({ headless, args });
+      const { headless, args, noSandbox, executablePath } = this._launchOpts;
+      this.browser = await this._browserLauncher({
+        headless,
+        args,
+        ...(executablePath ? { executablePath } : {}),
+      });
       this.browser.on?.('disconnected', () => {
         this.browser = null;
         this.ctx = null;
@@ -440,10 +452,14 @@ export class Session {
     return this.shotBuf;
   }
 
-  async snap(opts) {
+  async snap(opts = {}) {
     const tab = this.activeTab();
     if (!tab) return null;
-    const s = await takeSnapshot(tab.page, opts);
+    const probeOpts = typeof opts === 'number'
+      ? { startRef: opts }
+      : { startRef: this.nextRef, ...(opts || {}) };
+    const s = await takeSnapshot(tab.page, probeOpts);
+    this.nextRef += s.boxes.length;
     this.snapshot = s;
     if (s.meta?.title !== undefined) tab.title = s.meta.title;
     this.stats.snapshots++;
@@ -977,6 +993,18 @@ export class Session {
         }
       }
 
+      case 'extract': {
+        const format = a.format ?? 'text';
+        const maxChars = a.maxChars ?? 20000;
+        this.addLog('act', `extract ${format} (max ${maxChars} chars)`);
+        try {
+          const data = await extractPage(page, format, maxChars);
+          return { ok: true, data };
+        } catch (e) {
+          return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
+        }
+      }
+
       case 'read': {
         const maxChars = Math.min(100000, Math.max(500, Math.trunc(Number(a.maxChars) || 20000)));
         this.addLog('act', `read article text (max ${maxChars} chars)`);
@@ -989,18 +1017,35 @@ export class Session {
       }
 
       case 'screenshot': {
-        this.addLog('act', `screenshot${a.fullPage ? ' (fullPage)' : ''}`);
+        const imgType = a.type === 'jpeg' ? 'jpeg' : 'png';
+        this.addLog('act', `screenshot (${imgType}${a.fullPage ? ', fullPage' : ''})`);
         try {
-          const buf = await this.capture({ fullPage: Boolean(a.fullPage), quality: a.quality });
+          if (imgType === 'jpeg') {
+            const buf = await this.capture({ fullPage: Boolean(a.fullPage), quality: a.quality });
+            const tab = this.activeTab();
+            const base64 = buf.toString('base64');
+            return {
+              ok: true,
+              data: {
+                mimeType: 'image/jpeg',
+                base64,
+                bytes: buf.length,
+                shotVersion: this.shotVersion,
+                shotAt: this.shotAt,
+                url: tab?.page?.url?.() || '',
+                title: tab?.title || '',
+              },
+            };
+          }
+          const raw = await page.screenshot({ type: 'png', fullPage: Boolean(a.fullPage), timeout: 10000 });
+          const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
           const tab = this.activeTab();
           return {
             ok: true,
-            screenshot: {
-              mimeType: 'image/jpeg',
-              data: buf.toString('base64'),
+            data: {
+              mimeType: 'image/png',
+              base64: buf.toString('base64'),
               bytes: buf.length,
-              shotVersion: this.shotVersion,
-              shotAt: this.shotAt,
               url: tab?.page?.url?.() || '',
               title: tab?.title || '',
             },
@@ -1229,6 +1274,7 @@ export class Session {
 
     return this.enqueue(async () => {
       await this._teardown();
+      this.nextRef = 0;
       this.sessionActions = 0;
       this.stats = { actions: 0, snapshots: 0, tokens: 0, htmlBytes: 0, approvals: 0, taskRuns: 0 };
       this.downloads = [];

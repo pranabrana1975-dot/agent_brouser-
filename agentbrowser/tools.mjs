@@ -94,6 +94,22 @@ export const tools = [
     }),
   },
   {
+    name: 'browser_wait_for',
+    description: 'Wait until a CSS selector is visible, then return a fresh snapshot.',
+    inputSchema: obj({
+      selector: str('CSS selector'),
+      timeoutMs: { type: 'integer', minimum: 1, maximum: 30000, description: 'Maximum wait time in milliseconds.' },
+    }, ['selector']),
+  },
+  {
+    name: 'browser_extract',
+    description: 'Extract page text, rendered HTML, Markdown, links, or form metadata (never password/field values).',
+    inputSchema: obj({
+      format: { type: 'string', enum: ['text', 'html', 'markdown', 'links', 'forms'], description: 'Extraction format (default text).' },
+      maxChars: { type: 'integer', minimum: 1, maximum: 200000, description: 'Maximum characters to return (default 20000).' },
+    }),
+  },
+  {
     name: 'browser_read',
     description: 'Extract clean reader-mode prose from the active page (strips navigation, ads, and footers) for reading long articles.',
     inputSchema: obj({
@@ -102,9 +118,10 @@ export const tools = [
   },
   {
     name: 'browser_screenshot',
-    description: 'Capture a JPEG screenshot of the active page for visual inspection (charts, images, layout).',
+    description: 'Capture a screenshot of the active page for visual inspection (charts, images, layout).',
     inputSchema: obj({
       fullPage: bool('Capture full scrollable page instead of the current viewport.'),
+      type: { type: 'string', enum: ['png', 'jpeg'], description: 'Image format (default png).' },
     }),
   },
   {

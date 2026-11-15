@@ -4,8 +4,9 @@
 
 ## প্রধান বৈশিষ্ট্য
 
-- **Smart Agent Document (`lib/snapshot.mjs`):** active modal, viewport এবং `<main>`/`<article>`/`<form>`-কে অগ্রাধিকার দেয়; `<label for>`, `aria-labelledby`, icon alt, `disabled`/`checked`/`required`/`expanded` state, `<select>` options, open Shadow DOM এবং same-origin `<iframe>` সমর্থন করে।
-- **১৫টি Agent Tool (`tools.mjs`):** `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_hover`, `browser_scroll`, `browser_wait`, `browser_read`, `browser_screenshot`, `browser_upload`, `browser_navigate`, `browser_tabs`, `browser_task`।
+- **Smart Agent Document (`lib/snapshot.mjs`):** active modal, viewport এবং `<main>`/`<article>`/`<form>`-কে অগ্রাধিকার দেয়; প্রতি snapshot-এ নতুন অনন্য `e1..eN` ref দেয় যাতে পুরনো ref ভুল element-এ না লাগে; `<label for>`, `aria-labelledby`, icon alt, `disabled`/`checked`/`required`/`expanded` state, `<select>` options, open Shadow DOM এবং same-origin `<iframe>` সমর্থন করে।
+- **১৭টি Agent Tool (`tools.mjs`):** `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_hover`, `browser_scroll`, `browser_wait`, `browser_wait_for`, `browser_extract`, `browser_read`, `browser_screenshot`, `browser_upload`, `browser_navigate`, `browser_tabs`, `browser_task`।
+- **Structured Extraction ও One-Shot CLI (`lib/extract.mjs`, `cli.mjs`):** `text`, rendered `html`, `markdown`, `links` এবং `forms` (field value ছাড়া) নিষ্কাশন ও সরাসরি shell pipeline-এ ব্যবহার।
 - **Multi-Session Isolation (`lib/manager.mjs`):** একটিমাত্র shared Chromium প্রসেসের ওপর আলাদা `BrowserContext`-ভিত্তিক session (`x-session-id` / `Mcp-Session-Id`), idle TTL cleanup ও automatic crash recovery।
 - **Security & Guardrails (`lib/policy.mjs`):** ডিফল্টে private/loopback/metadata IP ও DNS-rebinding SSRF ব্লক, label-aware domain allow/block list, constant-time Bearer auth, password log masking, jailed file upload, এবং timeout-সহ human approval gate (ইংরেজি ও বাংলা)।
 - **Multi-Engine Planner (`lib/agent.mjs`):** DuckDuckGo → Bing → Brave (এবং ঐচ্ছিক SearXNG) fallback, Unicode/বাংলা-সচেতন extractive summary, per-task action budget, এবং ঐচ্ছিক OpenAI-compatible LLM synthesis hook।
@@ -84,7 +85,9 @@ const browser = new AgentBrowser('http://127.0.0.1:3000', {
 const page = await browser.open('https://example.com');
 console.log(page.text, page.boxes);
 
-// Element ও page actions (সর্বশেষ snapshot-এর ref ব্যবহার করুন)
+// Element, extraction ও page actions (সর্বশেষ snapshot-এর ref ব্যবহার করুন)
+// const markdown = await browser.extract('markdown');
+// await browser.waitFor('main', 10000);
 // await browser.click('e1');
 // await browser.type('e2', 'hello', { submit: true });
 // await browser.select('e3', 'বাংলা');
@@ -92,8 +95,24 @@ console.log(page.text, page.boxes);
 // await browser.hover('e4');
 // await browser.wait({ text: 'Done', timeoutMs: 5000 });
 // const article = await browser.read({ maxChars: 15000 });
-// const jpegBuf = await browser.screenshot({ fullPage: false });
+// const image = await browser.screenshot(); // { mimeType: 'image/png', base64, ... }
 ```
+
+## One-shot CLI
+
+HTTP server ছাড়াই সরাসরি Chromium দিয়ে পেজ খুলে পাইপ করা যায়:
+
+```sh
+node cli.mjs fetch https://example.com --dump markdown
+node cli.mjs fetch https://example.com --dump links
+node cli.mjs fetch https://example.com --dump text --max-chars 10000
+```
+
+`--dump`-এর format: `text`, `html`, `markdown`, `links`, `forms`। Links ও forms JSON; অন্য format text। প্রয়োজনে `CHROMIUM_EXECUTABLE_PATH` দিয়ে বিদ্যমান Chromium executable নির্দিষ্ট করা যায়।
+
+## Obscura থেকে পার্থক্য
+
+[Obscura](https://github.com/h4ckf0r0day/obscura) নিজস্ব Rust/V8 engine ও CDP implementation ব্যবহার করে। এই project Chromium + Playwright ব্যবহার করে; Obscura-এর memory, speed, stealth বা সম্পূর্ণ tool/CDP compatibility-এর দাবি করা হচ্ছে না। Snapshot ref-গুলো কেবল সর্বশেষ snapshot-এর জন্য বৈধ; navigation বা page পরিবর্তনের পরে আবার snapshot নিন। Extraction সীমাবদ্ধ এবং পূর্ণ accessibility tree নয়।
 
 ## HTTP Endpoints
 

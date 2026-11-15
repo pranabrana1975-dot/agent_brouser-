@@ -316,8 +316,11 @@ test('Actions, password masking, popup capture, per-tab titles, screenshots, upl
   const article = await env.sdk.read({ maxChars: 5000 });
   assert.match(article.text, /coronavirus research/);
 
-  // Live screenshot works via both SDK and GET /api/shot.jpg!
-  const shotBuf = await env.sdk.screenshot();
+  // Live screenshot works via SDK (default { mimeType, base64 } + buffer mode) and GET /api/shot.jpg!
+  const shotObj = await env.sdk.screenshot();
+  assert.equal(shotObj.mimeType, 'image/png');
+  assert.ok(shotObj.base64.length > 0);
+  const shotBuf = await env.sdk.screenshot({ type: 'jpeg', encoding: 'buffer' });
   assert.equal(shotBuf[0], 0xff);
   assert.equal(shotBuf[1], 0xd8);
   const httpShot = await fetch(`${env.baseUrl}/api/shot.jpg`, {
@@ -429,7 +432,7 @@ test('Multi-session isolation, shared browser, crash recovery, storage validatio
   });
   const mcpShot = await mcpShotRes.json();
   assert.equal(mcpShot.result.content[0].type, 'image');
-  assert.equal(mcpShot.result.content[0].mimeType, 'image/jpeg');
+  assert.equal(mcpShot.result.content[0].mimeType, 'image/png');
 
   // Monotonic log indices even past 600 log entries
   const rawS1 = env.manager.get('agent-1');

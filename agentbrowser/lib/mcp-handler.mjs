@@ -1,15 +1,55 @@
 // mcp-handler.mjs — Shared Model Context Protocol (JSON-RPC 2.0) dispatcher.
 // Used by both the stdio bridge (mcp.mjs) and the Streamable HTTP endpoint (/mcp).
-//
-// Returns compact Agent Document text by default instead of dumping redundant
-// raw bodyText and bounding boxes into the model context, and returns native
-// MCP image blocks for browser_screenshot.
 
 import { tools } from '../tools.mjs';
 import { runTask } from './agent.mjs';
 
 export const SUPPORTED_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
 export const SERVER_INFO = { name: 'agentbrowser', version: '1.1.0' };
+
+function matchesSchemaSpec(spec, value) {
+  if (!spec || typeof spec !== 'object') return true;
+  if (Array.isArray(spec.oneOf)) {
+    return spec.oneOf.some((branch) => matchesSchemaSpec(branch, value));
+  }
+  if (spec.type === 'integer') {
+    if (!Number.isInteger(value)) return false;
+  } else if (spec.type === 'number') {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+  } else if (spec.type === 'array') {
+    if (!Array.isArray(value)) return false;
+    if (spec.minItems !== undefined && value.length < spec.minItems) return false;
+    if (spec.maxItems !== undefined && value.length > spec.maxItems) return false;
+    if (spec.items && !value.every((item) => matchesSchemaSpec(spec.items, item))) return false;
+  } else if (spec.type && typeof value !== spec.type) {
+    return false;
+  }
+  if (Array.isArray(spec.enum) && !spec.enum.includes(value)) return false;
+  if (spec.minimum !== undefined && value < spec.minimum) return false;
+  if (spec.maximum !== undefined && value > spec.maximum) return false;
+  return true;
+}
+
+export function validateToolCall(name, args) {
+  const tool = tools.find((t) => t.name === name);
+  if (!tool) throw new Error(`Unknown tool: ${name}`);
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error('Arguments must be an object');
+  }
+  const schema = tool.inputSchema;
+  for (const key of schema.required || []) {
+    if (!(key in args) || args[key] === undefined) {
+      throw new Error(`Missing argument: ${key}`);
+    }
+  }
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined) continue;
+    const spec = schema.properties?.[key];
+    if (!spec) throw new Error(`Unknown argument: ${key}`);
+    if (!matchesSchemaSpec(spec, value)) throw new Error(`Invalid argument: ${key}`);
+  }
+  return tool;
+}
 
 function textContent(text) {
   return { content: [{ type: 'text', text: String(text ?? '') }] };
@@ -31,8 +71,9 @@ function articleContent(article) {
 }
 
 function shotContent(shot) {
-  const content = [{ type: 'image', data: shot.data, mimeType: shot.mimeType || 'image/jpeg' }];
-  if (shot.url || shot.title) {
+  const b64 = shot?.base64 ?? shot?.data ?? '';
+  const content = [{ type: 'image', data: b64, mimeType: shot?.mimeType || 'image/png' }];
+  if (shot?.url || shot?.title) {
     content.push({ type: 'text', text: `[url] ${shot.url || ''}\n[title] ${shot.title || ''}`.trim() });
   }
   return { content };
@@ -41,6 +82,7 @@ function shotContent(shot) {
 // Build a tool executor backed by the HTTP SDK client.
 export function createSdkExecutor(browser) {
   return async function invokeTool(name, a = {}) {
+    validateToolCall(name, a);
     switch (name) {
       case 'browser_open':
         return snapContent(await browser.open(a.url, { compact: true }));
@@ -62,10 +104,14 @@ export function createSdkExecutor(browser) {
         return snapContent(await browser.scroll(a.dy, { dx: a.dx, ref: a.ref, compact: true }));
       case 'browser_wait':
         return snapContent(await browser.wait({ text: a.text, selector: a.selector, url: a.url, state: a.state, timeoutMs: a.timeoutMs, compact: true }));
+      case 'browser_wait_for':
+        return snapContent(await browser.wait({ selector: a.selector, timeoutMs: a.timeoutMs, compact: true }));
+      case 'browser_extract':
+        return textContent(JSON.stringify(await browser.extract(a.format, a.maxChars)));
       case 'browser_read':
         return articleContent(await browser.read({ maxChars: a.maxChars }));
       case 'browser_screenshot':
-        return shotContent(await browser.screenshot({ fullPage: a.fullPage, encoding: 'object' }));
+        return shotContent(await browser.screenshot({ fullPage: a.fullPage, type: a.type, encoding: 'object' }));
       case 'browser_upload':
         return snapContent(await browser.upload(a.ref, a.paths, { compact: true }));
       case 'browser_navigate':
@@ -89,6 +135,7 @@ export function createSessionExecutor(getSession) {
   };
 
   return async function invokeTool(name, a = {}) {
+    validateToolCall(name, a);
     const session = typeof getSession === 'function' ? await getSession() : getSession;
     switch (name) {
       case 'browser_open':
@@ -111,16 +158,18 @@ export function createSessionExecutor(getSession) {
         return snapContent((await unwrap(session, { op: 'scroll', dy: a.dy, dx: a.dx, ref: a.ref, compact: true })).snapshot);
       case 'browser_wait':
         return snapContent((await unwrap(session, { op: 'wait', text: a.text, selector: a.selector, url: a.url, state: a.state, timeoutMs: a.timeoutMs, compact: true })).snapshot);
+      case 'browser_wait_for':
+        return snapContent((await unwrap(session, { op: 'wait', selector: a.selector, timeoutMs: a.timeoutMs, compact: true })).snapshot);
+      case 'browser_extract':
+        return textContent(JSON.stringify((await unwrap(session, { op: 'extract', format: a.format, maxChars: a.maxChars })).data));
       case 'browser_read':
         return articleContent((await unwrap(session, { op: 'read', maxChars: a.maxChars })).article);
       case 'browser_screenshot':
-        return shotContent((await unwrap(session, { op: 'screenshot', fullPage: a.fullPage })).screenshot);
+        return shotContent((await unwrap(session, { op: 'screenshot', fullPage: a.fullPage, type: a.type })).data);
       case 'browser_upload':
         return snapContent((await unwrap(session, { op: 'upload', ref: a.ref, paths: a.paths, compact: true })).snapshot);
-      case 'browser_navigate': {
-        if (!['back', 'forward', 'reload'].includes(a.op)) throw new Error('invalid navigation operation');
+      case 'browser_navigate':
         return snapContent((await unwrap(session, { op: a.op, compact: true })).snapshot);
-      }
       case 'browser_tabs': {
         if (a.op === 'list') {
           await session.init();
@@ -189,9 +238,6 @@ export async function dispatchMcpMessage(req, invokeTool) {
         return { jsonrpc: '2.0', id: req.id, error: { code: -32602, message: 'Tool name required' } };
       }
       const args = req.params?.arguments ?? {};
-      if (typeof args !== 'object' || args === null || Array.isArray(args)) {
-        return { jsonrpc: '2.0', id: req.id, error: { code: -32602, message: 'Tool arguments must be an object' } };
-      }
       try {
         const result = await invokeTool(toolName, args);
         return { jsonrpc: '2.0', id: req.id, result };

@@ -102,8 +102,10 @@ test('Playwright Chromium E2E: snapshots, forms, shadow DOM, iframes, popups, re
   const article = await sdk.read();
   assert.match(article.text, /important scientific results/);
 
-  // Real JPEG screenshot
-  const jpg = await sdk.screenshot();
+  // Real screenshot (both object and JPEG buffer forms)
+  const shot = await sdk.screenshot();
+  assert.equal(shot.mimeType, 'image/png');
+  const jpg = await sdk.screenshot({ type: 'jpeg', encoding: 'buffer' });
   assert.equal(jpg[0], 0xff);
   assert.equal(jpg[1], 0xd8);
 
