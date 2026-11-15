@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Environment & local secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state & artifacts
+storage-state*.json
+downloads/
+coverage/
+*.log
+npm-debug.log*
+
+# OS / system clutter
+.DS_Store
+Thumbs.db
+.pki/
+.sudo_as_admin_successful

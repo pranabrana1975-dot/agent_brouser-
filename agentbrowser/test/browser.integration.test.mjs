@@ -9,7 +9,7 @@ const binary = process.env.CHROMIUM_EXECUTABLE_PATH || chromium.executablePath()
 test('browser navigation, extraction, refs, wait and screenshot', { skip: !fs.existsSync(binary) ? 'Chromium not installed' : false, timeout: 60000 }, async () => {
   const server = http.createServer((req, res) => res.end('<title>Fixture</title><main><h1>Example</h1><p>Local fixture text.</p><a href="/next">Next</a><input placeholder="Search"></main>'));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const session = new Session();
+  const session = new Session({ policy: { allowPrivateNetworks: true } });
   try {
     const opened = await session.act({ op: 'open', url: `http://127.0.0.1:${server.address().port}` });
     assert.ok(opened.snapshot);
