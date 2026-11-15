@@ -17,14 +17,16 @@ export class Policy {
   }
 
   hostAllowed(url) {
-    let host = '';
-    try { host = new URL(url).hostname; } catch { return { ok: false, reason: 'invalid url' }; }
-    if (url.startsWith('file:')) return { ok: false, reason: 'file:// is not reachable from the agent' };
+    let parsed;
+    try { parsed = new URL(url); } catch { return { ok: false, reason: 'invalid url' }; }
+    if (parsed.protocol === 'about:' && parsed.href === 'about:blank') return { ok: true };
+    if (!['http:', 'https:'].includes(parsed.protocol)) return { ok: false, reason: 'only HTTP and HTTPS are allowed' };
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
     for (const pat of this.blockedHosts) {
       const rx = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i');
       if (rx.test(host)) return { ok: false, reason: `host blocked by policy: ${pat}` };
     }
-    if (this.allowedHosts.length && !this.allowedHosts.some((p) => host.endsWith(p))) {
+    if (this.allowedHosts.length && !this.allowedHosts.some((p) => { const domain = p.toLowerCase().replace(/^\*\./, '').replace(/\.$/, ''); return host === domain || host.endsWith('.' + domain); })) {
       return { ok: false, reason: `host not in allowlist` };
     }
     return { ok: true };

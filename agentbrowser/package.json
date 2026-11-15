@@ -1,15 +1,16 @@
 {
   "name": "agentbrowser",
   "version": "1.0.0",
-  "description": "An agent-only browser on top of Chromium: no human browsing surface, structured Agent Documents instead of pixels, guardrails with human approval.",
+  "description": "Headless browser service and MCP tools for agents",
   "type": "module",
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "dev": "PORT=3000 node server.mjs"
+    "mcp": "node mcp.mjs",
+    "test": "node --test"
   },
   "dependencies": {
-    "playwright": "^1.49.1"
+    "playwright": "^1.65.1"
   },
   "license": "MIT"
 }
