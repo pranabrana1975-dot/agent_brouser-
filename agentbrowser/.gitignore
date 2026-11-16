@@ -2,6 +2,8 @@ node_modules/
 storage-state*.json
 downloads/
 traces/
+workflows/
+*.workflow.json
 trace-*.zip
 *.har
 coverage/

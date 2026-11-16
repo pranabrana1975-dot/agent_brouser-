@@ -286,6 +286,7 @@ export const PAGE_PROBE = (rawOpts = 0) => {
   const candidates = [];
   const headingCandidates = [];
   const textCandidates = [];
+  const crossOriginFrames = [];
   const seenActionable = new Set();
   let order = 0;
   let frameSeq = 0;
@@ -392,7 +393,7 @@ export const PAGE_PROBE = (rawOpts = 0) => {
       }
     }
 
-    // 5) Accessible same-origin iframes (top-level document only to keep refs bounded)
+    // 5) Same-origin iframes in-pass + tag cross-origin iframes for Playwright Frame API probing
     if (!frameId && frameSeq < MAX_FRAMES) {
       let iframes = [];
       try { iframes = Array.from(root.querySelectorAll('iframe')); } catch {}
@@ -400,17 +401,36 @@ export const PAGE_PROBE = (rawOpts = 0) => {
         if (frameSeq >= MAX_FRAMES) break;
         const fr = rectOf(frameEl, view, offset);
         if (!fr) continue;
+        const fid = 'f' + ++frameSeq;
+        try { frameEl.setAttribute('data-agent-frame', fid); } catch {}
         try {
           const childDoc = frameEl.contentDocument;
           const childWin = frameEl.contentWindow;
-          if (!childDoc || !childDoc.documentElement || !childWin) continue;
+          if (!childDoc || !childDoc.documentElement || !childWin) {
+            crossOriginFrames.push({
+              frameId: fid,
+              src: frameEl.getAttribute('src') || '',
+              x: Math.round(fr.left),
+              y: Math.round(fr.top),
+              w: Math.round(fr.width),
+              h: Math.round(fr.height),
+            });
+            continue;
+          }
           // Probe access (throws SecurityError on cross-origin frames)
           void childDoc.title;
           clearRefsInRoot(childDoc, 0);
-          const fid = 'f' + ++frameSeq;
-          frameEl.setAttribute('data-agent-frame', fid);
           collectFromRoot(childDoc, childDoc, childWin, { x: fr.left, y: fr.top }, fid, 0);
-        } catch {}
+        } catch {
+          crossOriginFrames.push({
+            frameId: fid,
+            src: frameEl.getAttribute('src') || '',
+            x: Math.round(fr.left),
+            y: Math.round(fr.top),
+            w: Math.round(fr.width),
+            h: Math.round(fr.height),
+          });
+        }
       }
     }
   };
@@ -532,6 +552,8 @@ export const PAGE_PROBE = (rawOpts = 0) => {
     nodes,
     textBits: textBits.map((t) => t.text),
     bodyText,
+    crossOriginFrames,
+    lastRef: refSeq,
   };
 };
 
@@ -548,7 +570,7 @@ function formatFlags(nd) {
   if (nd.expanded === true) flags.push('expanded');
   else if (nd.expanded === false) flags.push('collapsed');
   if (nd.selected) flags.push('selected');
-  if (nd.frame) flags.push(`frame=${nd.frame}`);
+  if (nd.frame) flags.push(nd.crossOrigin ? `frame=${nd.frame}:xorigin` : `frame=${nd.frame}`);
   return flags;
 }
 
@@ -606,6 +628,7 @@ export function renderDoc(raw, { devtoolsBadge = '' } = {}) {
       v: nd.inViewport,
     };
     if (nd.frame) box.frame = nd.frame;
+    if (nd.crossOrigin) box.crossOrigin = true;
     if (nd.value) box.value = nd.value;
     if (nd.inputType) box.inputType = nd.inputType;
     if (nd.href) box.href = nd.href;
@@ -637,8 +660,155 @@ export function renderDoc(raw, { devtoolsBadge = '' } = {}) {
   };
 }
 
-export function toWireSnapshot(snap, { full = true, includeBody = false } = {}) {
+// ---------- Compact Delta Snapshot Renderer (saves 60–85% tokens on repeated actions) ----------
+function boxKey(b) {
+  return `${b.role}::${String(b.name || '').toLowerCase()}::${b.href || ''}::${b.frame || ''}`;
+}
+
+function boxStateSig(b) {
+  const parts = [];
+  if (b.value) parts.push(`value=${JSON.stringify(b.value)}`);
+  if (b.checked !== undefined && b.checked !== null) {
+    parts.push(b.checked === true ? 'checked' : b.checked === false ? 'unchecked' : `checked=${b.checked}`);
+  }
+  if (b.disabled) parts.push('disabled');
+  if (b.expanded === true) parts.push('expanded');
+  else if (b.expanded === false) parts.push('collapsed');
+  return parts.join(',') || 'default';
+}
+
+function formatBoxLine(b) {
+  const roleLabel = b.inputType && b.role === 'textbox' ? `textbox[${b.inputType}]` : b.role;
+  const bits = [roleLabel, JSON.stringify(b.name || '')];
+  if (b.value) bits.push(`value=${JSON.stringify(b.value)}`);
+  const flags = formatFlags(b);
+  if (flags.length) bits.push(`[${flags.join(',')}]`);
+  if (b.href) bits.push(`→ ${b.href.startsWith('http') ? b.href : b.href.slice(0, 80)}`);
+  return `${b.ref} ${bits.join(' ')}`;
+}
+
+export function renderDeltaSnapshot(prev, curr, { toasts = [], devtoolsBadge = '' } = {}) {
+  if (!curr) return null;
+  // Fall back to full snapshot when no baseline exists or origin+pathname changed completely.
+  if (!prev || !prev.meta || !curr.meta) {
+    return { text: curr.text, tokens: curr.tokens, fullFallback: true, stats: null };
+  }
+  try {
+    const u1 = new URL(prev.meta.url || 'about:blank');
+    const u2 = new URL(curr.meta.url || 'about:blank');
+    if (u1.origin !== u2.origin || u1.pathname !== u2.pathname) {
+      return { text: curr.text, tokens: curr.tokens, fullFallback: true, stats: null };
+    }
+  } catch {}
+
+  const prevMap = new Map();
+  for (const b of prev.boxes || []) {
+    const k = boxKey(b);
+    if (!prevMap.has(k)) prevMap.set(k, []);
+    prevMap.get(k).push(b);
+  }
+
+  const added = [];
+  const modified = [];
+  const unchanged = [];
+  const matchedPrev = new Set();
+
+  for (const b of curr.boxes || []) {
+    const candidates = prevMap.get(boxKey(b));
+    const old = candidates?.find((c) => !matchedPrev.has(c));
+    if (!old) {
+      added.push(b);
+    } else {
+      matchedPrev.add(old);
+      const sOld = boxStateSig(old);
+      const sNew = boxStateSig(b);
+      if (sOld !== sNew) modified.push({ box: b, from: sOld, to: sNew });
+      else unchanged.push(b);
+    }
+  }
+
+  const removed = (prev.boxes || []).filter((b) => !matchedPrev.has(b));
+  const prevTexts = new Set(prev.textBits || []);
+  const addedText = (curr.textBits || []).filter((t) => !prevTexts.has(t)).slice(0, 8);
+
+  const lines = [];
+  lines.push(`[url] ${curr.meta.url}`);
+  if (prev.meta.title !== curr.meta.title) lines.push(`[title] ${curr.meta.title}`);
+  lines.push(`[viewport] ${curr.meta.vw}x${curr.meta.vh}  scrollY=${curr.meta.scrollY}/${Math.max(0, curr.meta.docHeight - curr.meta.vh)}`);
+  if (devtoolsBadge) lines.push(`[devtools] ${devtoolsBadge}`);
+  lines.push(`[delta] +${added.length} added, ~${modified.length} changed, -${removed.length} removed, ${unchanged.length} unchanged`);
+
+  for (const t of toasts.slice(-5)) {
+    lines.push(`! toast[${t.role || 'status'}] ${JSON.stringify(t.text)}`);
+  }
+  for (const b of added) {
+    lines.push(`+ ${formatBoxLine(b)}`);
+  }
+  for (const m of modified) {
+    lines.push(`~ ${formatBoxLine(m.box)}  (${m.from} → ${m.to})`);
+  }
+  for (const b of removed.slice(0, 15)) {
+    lines.push(`- ${b.role} ${JSON.stringify(b.name || '')}`);
+  }
+  if (addedText.length) {
+    for (const t of addedText) lines.push(`+ text: ${t}`);
+  }
+  // Keep compact ref index for visible unchanged controls so agent can act immediately without re-snapshotting.
+  const keptRefs = unchanged
+    .filter((b) => b.v !== false)
+    .slice(0, 40)
+    .map((b) => `${b.ref}=${JSON.stringify(String(b.name || b.role).slice(0, 28))}`);
+  if (keptRefs.length) {
+    const more = unchanged.length > keptRefs.length ? ` (+${unchanged.length - keptRefs.length} more)` : '';
+    lines.push(`[refs] ${keptRefs.join(' ')}${more}`);
+  }
+
+  const text = lines.join('\n');
+  const tokens = tokenEstimate(text);
+  const savedTokens = Math.max(0, curr.tokens - tokens);
+  return {
+    text,
+    tokens,
+    fullTokens: curr.tokens,
+    savedTokens,
+    fullFallback: false,
+    stats: {
+      added: added.length,
+      modified: modified.length,
+      removed: removed.length,
+      unchanged: unchanged.length,
+      toasts: toasts.length,
+    },
+  };
+}
+
+export function toWireSnapshot(snap, {
+  full = true,
+  includeBody = false,
+  delta = false,
+  prevSnap = null,
+  toasts = [],
+  devtoolsBadge = '',
+} = {}) {
   if (!snap) return null;
+  if (delta) {
+    const d = renderDeltaSnapshot(prevSnap, snap, { toasts, devtoolsBadge });
+    const out = {
+      text: d.text,
+      tokens: d.tokens,
+      delta: !d.fullFallback,
+      ...(d.stats ? { deltaStats: d.stats, savedTokens: d.savedTokens, fullTokens: d.fullTokens } : {}),
+      htmlBytes: snap.htmlBytes,
+      truncatedActions: snap.truncatedActions || 0,
+      meta: snap.meta,
+    };
+    if (full) out.boxes = snap.boxes;
+    if (includeBody) {
+      out.bodyText = snap.bodyText;
+      out.textBits = snap.textBits;
+    }
+    return out;
+  }
   const out = {
     text: snap.text,
     tokens: snap.tokens,
@@ -654,10 +824,73 @@ export function toWireSnapshot(snap, { full = true, includeBody = false } = {}) 
   return out;
 }
 
+// Probe cross-origin child iframes via Playwright's Frame API (CDP bypasses SOP cleanly).
+async function mergeCrossOriginFrames(page, raw) {
+  if (!Array.isArray(raw?.crossOriginFrames) || !raw.crossOriginFrames.length) return;
+  if (typeof page?.frames !== 'function') return;
+
+  const byFrameId = new Map(raw.crossOriginFrames.map((f) => [f.frameId, f]));
+  const mainFrame = typeof page.mainFrame === 'function' ? page.mainFrame() : null;
+  const childFrames = page.frames().filter((f) => f && f !== mainFrame);
+  if (!childFrames.length) return;
+
+  let refCursor = Number(raw.lastRef) || 0;
+  const actionCount = raw.nodes.filter((n) => n.ref).length;
+  let remainingBudget = Math.max(8, 90 - actionCount);
+
+  for (const frame of childFrames) {
+    if (remainingBudget <= 0 || byFrameId.size === 0) break;
+    try {
+      const fUrl = typeof frame.url === 'function' ? frame.url() : '';
+      if (!fUrl || fUrl === 'about:blank' || fUrl.startsWith('data:')) continue;
+      if (typeof frame.isDetached === 'function' && frame.isDetached()) continue;
+
+      let info = null;
+      if (typeof frame.frameElement === 'function') {
+        const handle = await frame.frameElement().catch(() => null);
+        if (handle) {
+          const fid = await handle.getAttribute('data-agent-frame').catch(() => null);
+          await handle.dispose?.().catch(() => {});
+          if (fid && byFrameId.has(fid)) info = byFrameId.get(fid);
+        }
+      }
+      if (!info) continue;
+      byFrameId.delete(info.frameId);
+
+      const perFrameCap = Math.min(20, remainingBudget);
+      const childRaw = await frame.evaluate(PAGE_PROBE, { startRef: refCursor, maxActions: perFrameCap }).catch(() => null);
+      if (!childRaw || !Array.isArray(childRaw.nodes)) continue;
+
+      refCursor = Math.max(refCursor, Number(childRaw.lastRef) || refCursor);
+      for (const nd of childRaw.nodes) {
+        if (!nd.ref) continue;
+        const absX = Math.round(info.x + (nd.x || 0));
+        const absY = Math.round(info.y + (nd.y || 0));
+        const inVp = absX + (nd.w || 0) > 0 && absY + (nd.h || 0) > 0 && absX < raw.vw && absY < raw.vh;
+        raw.nodes.push({
+          ...nd,
+          x: absX,
+          y: absY,
+          inViewport: inVp,
+          frame: info.frameId,
+          crossOrigin: true,
+        });
+        remainingBudget -= 1;
+        if (remainingBudget <= 0) break;
+      }
+      raw.totalActions = (raw.totalActions || 0) + (childRaw.totalActions || 0);
+    } catch {}
+  }
+  raw.lastRef = refCursor;
+}
+
 export async function takeSnapshot(page, startRefOrOpts = 0) {
   const devtoolsBadge = typeof startRefOrOpts === 'object' && startRefOrOpts
     ? String(startRefOrOpts.devtoolsBadge || '')
     : '';
   const raw = await page.evaluate(PAGE_PROBE, startRefOrOpts);
-  return renderDoc(raw, { devtoolsBadge });
+  await mergeCrossOriginFrames(page, raw);
+  const doc = renderDoc(raw, { devtoolsBadge });
+  doc.lastRef = Number(raw?.lastRef) || 0;
+  return doc;
 }

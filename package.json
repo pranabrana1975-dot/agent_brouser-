@@ -1,8 +1,8 @@
 {
   "name": "agentbrowser-workspace",
   "private": true,
-  "version": "1.2.0",
-  "description": "Headless browser control plane, F12 Agent DevTools, CLI, JavaScript SDK, and MCP server for AI agents",
+  "version": "2.0.0",
+  "description": "AgentBrowser v2.0: AI browser platform, Mission Control dashboard, batch & workflow replay/Playwright codegen, F12 DevTools, JS/TS SDK, CLI, and full MCP server",
   "engines": {
     "node": ">=20"
   },
