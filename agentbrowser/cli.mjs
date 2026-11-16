@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cli.mjs — One-shot headless page fetch & F12 DevTools inspection for agents and shell pipelines.
+// cli.mjs — One-shot headless page fetch, structured scraper, PDF export & F12 DevTools CLI.
 // Output goes to stdout only; errors/usage go to stderr.
 
 import path from 'node:path';
@@ -7,13 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { Session } from './lib/session.mjs';
 import { EXTRACT_FORMATS } from './lib/extract.mjs';
 
-const DEVTOOLS_DUMPS = ['snapshot', 'network', 'console', 'perf', 'audit', 'security', 'storage', 'a11y'];
-const ALL_DUMPS = [...EXTRACT_FORMATS, ...DEVTOOLS_DUMPS];
+const DEVTOOLS_DUMPS = ['snapshot', 'pdf', 'network', 'console', 'perf', 'audit', 'security', 'storage', 'a11y'];
+const ALL_DUMPS = [...EXTRACT_FORMATS.filter((f) => f !== 'schema'), ...DEVTOOLS_DUMPS];
 
 const usage = [
   'Usage:',
-  `  node cli.mjs fetch <url> [--dump ${ALL_DUMPS.join('|')}] [--max-chars N] [--device desktop|iphone-15|pixel-8|ipad] [--allow-private]`,
-  '  node cli.mjs inspect <url> [--selector <css>] [--device desktop|iphone-15|pixel-8|ipad] [--allow-private]',
+  `  node cli.mjs fetch <url> [--dump ${ALL_DUMPS.join('|')}] [--max-chars N] [--max-pages N] [--selector <css>] [--device desktop|iphone-15|pixel-8|ipad] [--proxy <url>] [--allow-private]`,
+  '  node cli.mjs inspect <url> [--selector <css>] [--device desktop|iphone-15|pixel-8|ipad] [--proxy <url>] [--allow-private]',
 ].join('\n');
 
 export function parseCliArgs(argv) {
@@ -27,16 +27,20 @@ export function parseCliArgs(argv) {
     url,
     dump: 'text',
     maxChars: 20000,
+    maxPages: 1,
     selector: '',
     device: '',
+    proxy: '',
     allowPrivate: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === '--dump' && argv[i + 1]) opts.dump = argv[++i];
     else if (flag === '--max-chars' && argv[i + 1]) opts.maxChars = Number(argv[++i]);
+    else if (flag === '--max-pages' && argv[i + 1]) opts.maxPages = Number(argv[++i]);
     else if (flag === '--selector' && argv[i + 1]) opts.selector = argv[++i];
     else if (flag === '--device' && argv[i + 1]) opts.device = argv[++i];
+    else if (flag === '--proxy' && argv[i + 1]) opts.proxy = argv[++i];
     else if (flag === '--allow-private') opts.allowPrivate = true;
     else throw new Error(usage);
   }
@@ -60,6 +64,7 @@ if (isMain) {
   const session = new Session({
     minActionIntervalMs: 0,
     ...(opts.allowPrivate ? { policy: { allowPrivateNetworks: true } } : {}),
+    ...(opts.proxy ? { proxy: opts.proxy } : {}),
   });
 
   const must = async (action) => {
@@ -89,8 +94,17 @@ if (isMain) {
       }
       console.log(JSON.stringify(report, null, 2));
     } else if (EXTRACT_FORMATS.includes(opts.dump)) {
-      const { data } = await must({ op: 'extract', format: opts.dump, maxChars: opts.maxChars });
+      const { data } = await must({
+        op: 'extract',
+        format: opts.dump,
+        maxChars: opts.maxChars,
+        ...(opts.maxPages > 1 ? { maxPages: opts.maxPages } : {}),
+        ...(opts.selector ? { selector: opts.selector } : {}),
+      });
       console.log(data.content ?? JSON.stringify(data, null, 2));
+    } else if (opts.dump === 'pdf') {
+      const { data } = await must({ op: 'pdf', includeBase64: true });
+      process.stdout.write(Buffer.from(data.base64, 'base64'));
     } else if (opts.dump === 'snapshot') {
       console.log(opened.snapshot?.text || '');
     } else if (opts.dump === 'a11y') {

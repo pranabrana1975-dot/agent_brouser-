@@ -1,27 +1,22 @@
-// session.mjs — one isolated agent browser session: BrowserContext, tabs,
-// actions, human approvals, reader extraction, screenshots, and storage state.
+// session.mjs — One isolated agent browser session: BrowserContext lifecycle, tabs,
+// core interactions, human approvals, reader/SERP extraction, proxy & storage state.
+// Extended DevTools, batch, workflows, PDF, visual diff & human takeover live in session-ops.mjs.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { takeSnapshot, toWireSnapshot } from './snapshot.mjs';
-import { extractPage } from './extract.mjs';
-import { TabDevTools, ContextNetworkControls, NETWORK_PRESETS } from './devtools.mjs';
+import { extractPage, paginateExtract } from './extract.mjs';
+import { TabDevTools, ContextNetworkControls } from './devtools.mjs';
+import { DEVTOOLS_INIT_SCRIPT, readToasts, withAnnotatedOverlay } from './inspector.mjs';
+import { WorkflowRecorder, WorkflowStore, captureSemanticTarget } from './workflow.mjs';
+import { normalizeProxyConfig, redactProxy } from './metrics.mjs';
 import {
-  DEVICE_PRESETS,
-  DEVTOOLS_INIT_SCRIPT,
-  readToasts,
-  inspectElement,
-  captureA11yTree,
-  diffSnapshots,
-  collectPerformance,
-  inspectStorage,
-  clearStorage,
-  inspectSecurity,
-  runPageAudit,
-  evaluateExpression,
-  withAnnotatedOverlay,
-} from './inspector.mjs';
+  parseViewportSpec,
+  isValidKeyChord,
+  executeExtendedOp,
+  executeHumanTakeover,
+} from './session-ops.mjs';
 import {
   Policy,
   envFlag,
@@ -30,28 +25,15 @@ import {
 } from './policy.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const REF_RE = /^e\d{1,8}$/;
 const FRAME_RE = /^f\d{1,3}$/;
-const SAFE_KEY_RE = /^[a-zA-Z0-9+_.:-]{1,40}$/;
+const ALLOWED_MODIFIERS = new Set(['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift']);
 
-function parseViewport(input) {
-  if (input && typeof input === 'object') {
-    const width = Math.min(3840, Math.max(320, Math.trunc(Number(input.width) || 1280)));
-    const height = Math.min(2160, Math.max(240, Math.trunc(Number(input.height) || 800)));
-    return { width, height };
-  }
-  if (typeof input === 'string') {
-    const m = input.trim().match(/^(\d{3,4})\s*[xX×,]\s*(\d{3,4})$/);
-    if (m) {
-      return {
-        width: Math.min(3840, Math.max(320, Number(m[1]))),
-        height: Math.min(2160, Math.max(240, Number(m[2]))),
-      };
-    }
-  }
-  return { width: 1280, height: 800 };
-}
+const READONLY_OPS = new Set([
+  'snapshot', 'extract', 'read', 'screenshot', 'pdf', 'downloads',
+  'visual_diff', 'network', 'console', 'inspect', 'a11y', 'diff',
+  'perf', 'audit', 'security', 'trace',
+]);
 
 function buildUserAgent(browserVersion, override) {
   if (override && String(override).trim()) return String(override).trim();
@@ -90,11 +72,25 @@ export class Session {
     this._ownsBrowser = !this._getBrowser;
     this._launchOpts = defaultLaunchOptions(opts);
 
-    this.viewport = parseViewport(opts.viewport ?? process.env.AGENT_BROWSER_VIEWPORT);
+    this.policy = opts.policy instanceof Policy ? opts.policy : new Policy(opts.policy);
+    this.metrics = opts.metrics || null;
+
+    this.viewport = parseViewportSpec(opts.viewport ?? process.env.AGENT_BROWSER_VIEWPORT);
     this.locale = String(opts.locale || process.env.AGENT_BROWSER_LOCALE || 'en-US');
     this.timezoneId = String(opts.timezoneId || process.env.AGENT_BROWSER_TIMEZONE || 'Asia/Kolkata');
     this.colorScheme = opts.colorScheme === 'dark' ? 'dark' : 'light';
     this.userAgentOverride = opts.userAgent ?? process.env.AGENT_BROWSER_UA ?? '';
+    this.deltaMode = Boolean(opts.deltaMode);
+
+    // Per-session outbound proxy (env AGENT_BROWSER_PROXY is operator-trusted; API proxy checks allowPrivateNetworks).
+    if (opts.proxy !== undefined && opts.proxy !== null && opts.proxy !== '') {
+      this.proxy = normalizeProxyConfig(opts.proxy, { allowPrivate: this.policy.allowPrivateNetworks });
+    } else if (process.env.AGENT_BROWSER_PROXY) {
+      this.proxy = normalizeProxyConfig(process.env.AGENT_BROWSER_PROXY, { allowPrivate: true });
+    } else {
+      this.proxy = null;
+    }
+
     this.minActionIntervalMs = Number.isFinite(opts.minActionIntervalMs)
       ? Math.max(0, opts.minActionIntervalMs)
       : MIN_ACTION_INTERVAL_MS;
@@ -107,6 +103,7 @@ export class Session {
     this.uploadDir = opts.uploadDir ?? process.env.AGENT_BROWSER_UPLOAD_DIR ?? '';
     this.downloadDir = opts.downloadDir ?? process.env.AGENT_BROWSER_DOWNLOAD_DIR ?? '';
     this.traceDir = opts.traceDir ?? process.env.AGENT_BROWSER_TRACE_DIR ?? '';
+    this.workflowDir = opts.workflowDir ?? process.env.AGENT_BROWSER_WORKFLOW_DIR ?? '';
     this.allowEval = typeof opts.allowEval === 'boolean'
       ? opts.allowEval
       : envFlag('AGENT_BROWSER_ALLOW_EVAL', false);
@@ -114,7 +111,14 @@ export class Session {
       ? opts.allowSensitiveStorage
       : envFlag('AGENT_BROWSER_ALLOW_STORAGE_VALUES', false);
     this.autoCaptureOnViewers = opts.autoCaptureOnViewers !== false;
+
     this.netControls = new ContextNetworkControls({ traceDir: this.traceDir });
+    this.recorder = new WorkflowRecorder();
+    this.workflowStore = opts.workflowStore || new WorkflowStore({ workflowDir: this.workflowDir });
+    this.visualBaselines = new Map();
+    this.lastTracePath = null;
+    this._clipboardText = '';
+    this._lastBadge = '';
 
     this.createdAt = Date.now();
     this.lastActiveAt = this.createdAt;
@@ -129,7 +133,6 @@ export class Session {
     this.log = [];
     this.nextLog = 1;
     this.listeners = new Set();
-    this.policy = opts.policy instanceof Policy ? opts.policy : new Policy(opts.policy);
     this.pending = new Map();
     this.nextApproval = 1;
     this.snapshot = null;
@@ -150,6 +153,7 @@ export class Session {
     this.dirtyRisk = null;
     this.hasPassword = false;
     this.downloads = [];
+    this.nextDownload = 1;
     this._generation = 0;
     this._closed = false;
   }
@@ -227,13 +231,11 @@ export class Session {
       colorScheme: this.colorScheme,
       timezoneId: this.timezoneId,
       acceptDownloads: Boolean(this.downloadDir),
+      ...(this.proxy ? { proxy: this.proxy } : {}),
     });
 
-    this.ctx.on?.('close', () => {
-      this.ctx = null;
-    });
+    this.ctx.on?.('close', () => { this.ctx = null; });
 
-    // Capture popups and target="_blank" pages automatically instead of leaking them.
     this.ctx.on?.('page', (page) => {
       if (this._knownPages.has(page)) return;
       const tab = this._attachPage(page, { activate: true, source: 'popup' });
@@ -276,9 +278,9 @@ export class Session {
     });
 
     await this.ctx.addInitScript(DEVTOOLS_INIT_SCRIPT);
-
     await this._openNewTab('about:blank');
-    this.addLog('sys', `session "${this.id}" up · Chromium ${version} · viewport ${this.viewport.width}×${this.viewport.height}`);
+    const proxyNote = this.proxy ? ` · proxy ${this.proxy.server}` : '';
+    this.addLog('sys', `session "${this.id}" up · Chromium ${version} · viewport ${this.viewport.width}×${this.viewport.height}${proxyNote}`);
   }
 
   _clearFormTaint() {
@@ -359,6 +361,18 @@ export class Session {
     return tab;
   }
 
+  registerArtifact(meta) {
+    const item = {
+      id: 'dl' + this.nextDownload++,
+      at: Date.now(),
+      ...meta,
+    };
+    this.downloads.push(item);
+    if (this.downloads.length > 50) this.downloads.shift();
+    this.emit('download', { download: item });
+    return item;
+  }
+
   async _handleDownload(download) {
     const rawName = (typeof download.suggestedFilename === 'function' && download.suggestedFilename()) || 'download.bin';
     const safeName = path.basename(rawName).replace(/[^\w.\-() ]+/g, '_').slice(0, 120) || 'download.bin';
@@ -371,16 +385,14 @@ export class Session {
       await fs.mkdir(this.downloadDir, { recursive: true });
       const target = path.join(this.downloadDir, `${Date.now()}-${this.id}-${safeName}`);
       await download.saveAs(target);
-      const item = {
+      const stat = await fs.stat(target).catch(() => null);
+      this.registerArtifact({
         filename: safeName,
         path: target,
         url: typeof download.url === 'function' ? download.url() : '',
-        at: Date.now(),
-      };
-      this.downloads.push(item);
-      if (this.downloads.length > 50) this.downloads.shift();
+        ...(stat ? { bytes: stat.size } : {}),
+      });
       this.addLog('act', `download saved · ${safeName}`);
-      this.emit('download', { download: item });
     } catch (e) {
       this.addLog('err', `download failed: ${String(e.message || e).slice(0, 120)}`);
     }
@@ -392,6 +404,10 @@ export class Session {
 
   active() {
     return this.activeTab()?.page || null;
+  }
+
+  activePage() {
+    return this.active();
   }
 
   async _openNewTab(url = 'about:blank') {
@@ -417,7 +433,6 @@ export class Session {
     return tab.id;
   }
 
-  // Serialized tab operations so tab switches/closes never interleave mid-action.
   enqueue(fn) {
     this.touch();
     const run = this.actionQueue.then(fn);
@@ -491,14 +506,17 @@ export class Session {
     });
   }
 
+  // ---------- human takeover bypass (works even while paused) ----------
+  async takeover(input) {
+    return executeHumanTakeover(this, input);
+  }
+
   async capture({ fullPage = false, quality = 65, annotate = false } = {}) {
     await this.init();
     const page = this.active();
     if (!page) throw new Error('no active tab');
     const q = Math.min(95, Math.max(20, Math.trunc(Number(quality) || 65)));
-    if (annotate && !this.snapshot) {
-      await this.snap();
-    }
+    if (annotate && !this.snapshot) await this.snap();
     const doShot = async () => {
       const buf = await page.screenshot({ type: 'jpeg', quality: q, fullPage: Boolean(fullPage), timeout: 10000 });
       return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
@@ -517,23 +535,27 @@ export class Session {
     const tab = this.activeTab();
     if (!tab) return null;
     let devtoolsBadge = '';
+    let toasts = [];
     if (tab.devtools) {
-      const toasts = await readToasts(tab.page, { clear: false });
-      const toastCount = Array.isArray(toasts) ? toasts.length : 0;
-      devtoolsBadge = tab.devtools.badgeSummary({ toastCount });
+      const rawToasts = await readToasts(tab.page, { clear: false });
+      toasts = Array.isArray(rawToasts) ? rawToasts : [];
+      devtoolsBadge = tab.devtools.badgeSummary({ toastCount: toasts.length });
     }
+    this._lastBadge = devtoolsBadge;
+    this._lastToasts = toasts;
     const probeOpts = typeof opts === 'number'
       ? { startRef: opts, devtoolsBadge }
       : { startRef: this.nextRef, devtoolsBadge, ...(opts || {}) };
     const s = await takeSnapshot(tab.page, probeOpts);
-    this.nextRef += s.boxes.length;
+    this.nextRef = Math.max(this.nextRef + s.boxes.length, Number(s.lastRef) || 0);
     if (this.snapshot) this.prevSnapshot = this.snapshot;
     this.snapshot = s;
     if (s.meta?.title !== undefined) tab.title = s.meta.title;
     this.stats.snapshots++;
     this.stats.tokens += s.tokens;
     this.stats.htmlBytes += s.htmlBytes;
-    // Keep live screenshot buffer updated when observers subscribe to events.
+    this.metrics?.recordSnapshot?.(s.tokens);
+
     if (this.autoCaptureOnViewers && this.listeners.size > 0) {
       try {
         const buf = await tab.page.screenshot({ type: 'jpeg', quality: 60, timeout: 5000 });
@@ -545,6 +567,15 @@ export class Session {
     }
     this.emit('state', { state: this.state() });
     return s;
+  }
+
+  formatWireSnapshot(snap, wireOpts = {}) {
+    return toWireSnapshot(snap, {
+      ...wireOpts,
+      prevSnap: this.prevSnapshot,
+      toasts: this._lastToasts || [],
+      devtoolsBadge: this._lastBadge || '',
+    });
   }
 
   state() {
@@ -560,6 +591,7 @@ export class Session {
       tabs: this.tabList(),
       url: activeTab?.page?.url?.() || '',
       title: activeTab?.title || this.snapshot?.meta?.title || '',
+      viewport: { ...this.viewport },
       shotVersion: this.shotVersion,
       shotAt: this.shotAt,
       snapshot: toWireSnapshot(this.snapshot, { full: true }),
@@ -574,6 +606,8 @@ export class Session {
       })),
       downloads: this.downloads.slice(-20),
       devtools: this.devtoolsOverview(),
+      workflow: this.recorder.status(),
+      proxy: redactProxy(this.proxy),
       stats: { ...this.stats },
       policy: this.policy.toJSON(),
       agentStatus: this.agentStatus,
@@ -607,7 +641,9 @@ export class Session {
         pending: dt.pendingDialog ? dt.pendingDialog.record : null,
       } : { total: 0, mode: 'dismiss', pending: null },
       emulation: { ...this.netControls.emulation },
-      trace: this.netControls.traceStatus(),
+      trace: { ...this.netControls.traceStatus(), lastPath: this.lastTracePath },
+      visualBaselines: this.visualBaselines.size,
+      workflowRecording: this.recorder.status(),
       allowEval: this.allowEval,
     };
   }
@@ -623,7 +659,10 @@ export class Session {
       agentStatus: this.agentStatus,
       paused: this.paused,
       busy: Boolean(this.busy),
+      pending: this.pending.size,
       pendingApprovals: this.pending.size,
+      recording: this.recorder.active,
+      proxy: redactProxy(this.proxy),
       actions: this.stats.actions,
       createdAt: this.createdAt,
       lastActiveAt: this.lastActiveAt,
@@ -644,6 +683,7 @@ export class Session {
         timer = setTimeout(() => {
           if (!this.pending.has(id)) return;
           this.pending.delete(id);
+          this.metrics?.recordApproval?.('timeout');
           this.addLog('approval', `TIMEOUT (${Math.round(ttl / 1000)}s) · auto-denied · ${detail}`, { approvalId: id });
           this.emit('state', { state: this.state() });
           resolve({ allow: false, reason: 'approval timed out' });
@@ -662,6 +702,7 @@ export class Session {
     if (!p) return false;
     this.pending.delete(id);
     if (p.timer) clearTimeout(p.timer);
+    this.metrics?.recordApproval?.(allow ? 'allowed' : 'denied');
     this.addLog('approval', `${allow ? 'APPROVED' : 'DENIED'} by human · ${p.detail}`, { approvalId: id });
     p.resolve({ allow: Boolean(allow), reason: allow ? '' : 'denied by human' });
     this.emit('state', { state: this.state() });
@@ -691,7 +732,6 @@ export class Session {
     const cookies = Array.isArray(storageState.cookies) ? storageState.cookies : [];
     const origins = Array.isArray(storageState.origins) ? storageState.origins : [];
 
-    // Validate all cookies and origins against host policy before importing.
     for (const c of cookies) {
       const domain = String(c?.domain || '').replace(/^\./, '');
       const url = c?.url || (domain ? `https://${domain}/` : '');
@@ -726,7 +766,7 @@ export class Session {
     });
   }
 
-  // ---------- element lookup & upload jail ----------
+  // ---------- element lookup (top-level + same-origin & cross-origin iframes) & upload jail ----------
   _findBox(ref) {
     const r = String(ref || '').trim();
     if (!REF_RE.test(r)) return null;
@@ -796,25 +836,50 @@ export class Session {
   }
 
   async actNow(a, gen = this._generation) {
+    const t0 = Date.now();
+    let res;
+    try {
+      res = await this._executeActNow(a, gen);
+      const ok = Boolean(res?.ok && !res?.error && !res?.blocked);
+      this.metrics?.recordAction?.(a.op, Date.now() - t0, ok);
+      return res;
+    } catch (err) {
+      this.metrics?.recordAction?.(a.op, Date.now() - t0, false);
+      throw err;
+    }
+  }
+
+  async _executeActNow(a, gen = this._generation) {
     await this.init();
     await this.waitPause(gen);
     await this.throttle();
     const tab = this.activeTab();
     const page = tab?.page || null;
     if (!page) throw new Error('no active tab');
+
+    // Normalize convenience aliases (dblclick / rightclick)
+    const op = a.op === 'dblclick' || a.op === 'rightclick' ? 'click' : a.op;
+    const doubleClick = a.op === 'dblclick' ? true : Boolean(a.doubleClick);
+    const clickButton = a.op === 'rightclick' ? 'right' : a.button;
+
     this.stats.actions++;
     this.sessionActions++;
-    const READONLY_OPS = new Set([
-      'snapshot', 'extract', 'read', 'screenshot', 'network', 'console',
-      'inspect', 'a11y', 'diff', 'perf', 'audit', 'security', 'trace',
-    ]);
-    if (!READONLY_OPS.has(a.op)) {
+    if (!READONLY_OPS.has(op)) {
       this.lastMutatingActionSeq = this.stats.actions;
     }
 
-    const wireOpts = { full: a.compact ? false : a.full !== false, includeBody: Boolean(a.includeBody) };
+    const useDelta = a.delta !== undefined ? Boolean(a.delta) : this.deltaMode;
+    const wireOpts = {
+      full: a.compact ? false : a.full !== false,
+      includeBody: Boolean(a.includeBody),
+      delta: useDelta,
+    };
 
-    switch (a.op) {
+    // Delegate extended DevTools, batch, workflow, drag, clipboard, PDF, downloads & visual_diff
+    const extended = await executeExtendedOp(this, tab, page, a, { wireOpts, gen });
+    if (extended !== null) return extended;
+
+    switch (op) {
       case 'open': {
         let url = String(a.url || '').trim();
         if (!url) return { error: 'url required' };
@@ -835,15 +900,20 @@ export class Session {
           this.addLog('err', error);
           return { error };
         }
+        if (this.recorder.active && !a._skipRecord) {
+          this.recorder.record({ op: 'open', url });
+        }
         this._clearFormTaint();
         this.setAgentStatus('reading');
         const snap = await this.snap();
-        return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+        // Always emit full snapshot right after open unless explicitly forcing delta on same URL
+        return { ok: true, snapshot: toWireSnapshot(snap, { full: wireOpts.full, includeBody: wireOpts.includeBody }) };
       }
 
       case 'snapshot': {
+        if (typeof a.deltaMode === 'boolean') this.deltaMode = a.deltaMode;
         const snap = await this.snap();
-        return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+        return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
       }
 
       case 'click': {
@@ -872,15 +942,36 @@ export class Session {
             return { blocked: true, reason: decision.reason };
           }
         }
-        const button = ['left', 'right', 'middle'].includes(a.button) ? a.button : 'left';
-        this.addLog('act', `${a.doubleClick ? 'dblclick' : 'click'} ${box.ref} ${box.role} "${box.name}"`);
+        const button = ['left', 'right', 'middle'].includes(clickButton) ? clickButton : 'left';
+        const modifiers = Array.isArray(a.modifiers)
+          ? a.modifiers.filter((m) => ALLOWED_MODIFIERS.has(m))
+          : [];
+
+        if (this.recorder.active && !a._skipRecord) {
+          const target = await captureSemanticTarget(page, box);
+          this.recorder.record({
+            op: 'click',
+            target,
+            ...(button !== 'left' ? { button } : {}),
+            ...(doubleClick ? { doubleClick: true } : {}),
+            ...(modifiers.length ? { modifiers } : {}),
+          });
+        }
+
+        const labelOp = doubleClick ? 'dblclick' : (button === 'right' ? 'rightclick' : 'click');
+        this.addLog('act', `${labelOp} ${box.ref} ${box.role} "${box.name}"`);
         const tabsBefore = this.tabs.length;
         try {
           await loc.scrollIntoViewIfNeeded?.({ timeout: 3000 }).catch(() => {});
-          if (a.doubleClick && typeof loc.dblclick === 'function') {
-            await loc.dblclick({ button, timeout: 6000 });
+          const clickOpts = {
+            button,
+            timeout: 6000,
+            ...(modifiers.length ? { modifiers } : {}),
+          };
+          if (doubleClick && typeof loc.dblclick === 'function') {
+            await loc.dblclick(clickOpts);
           } else {
-            await loc.click({ button, timeout: 6000 });
+            await loc.click(clickOpts);
           }
           if (verdict.rule === 'credentials' || this.policy.isSubmitControl(box)) {
             this._clearFormTaint();
@@ -889,7 +980,7 @@ export class Session {
           await targetPage.waitForLoadState?.('domcontentloaded', { timeout: 6000 }).catch(() => {});
           await sleep(this.tabs.length > tabsBefore ? 350 : 220);
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
@@ -925,6 +1016,18 @@ export class Session {
           if (!decision.allow) return { blocked: true, reason: decision.reason };
         }
 
+        if (this.recorder.active && !a._skipRecord) {
+          const target = await captureSemanticTarget(page, box);
+          this.recorder.record({
+            op: 'type',
+            target,
+            text,
+            submit,
+            clear,
+            ...(isSecret ? { secret: true } : {}),
+          });
+        }
+
         const displayValue = isSecret ? '"••••••"' : JSON.stringify(text.slice(0, 80));
         this.addLog('act', `type ${box.ref} ← ${displayValue}${submit ? ' + Enter' : ''}`);
 
@@ -953,7 +1056,7 @@ export class Session {
           }
 
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
@@ -965,6 +1068,11 @@ export class Session {
         if (box.disabled) return { blocked: true, reason: `element ${a.ref} is disabled` };
         const values = Array.isArray(a.value) ? a.value.map(String) : [String(a.value ?? '')];
         if (!values.length || !values[0]) return { error: 'value required' };
+
+        if (this.recorder.active && !a._skipRecord) {
+          const target = await captureSemanticTarget(page, box);
+          this.recorder.record({ op: 'select', target, value: values.length === 1 ? values[0] : values });
+        }
 
         this.addLog('act', `select ${box.ref} "${box.name}" ← ${JSON.stringify(values).slice(0, 80)}`);
         try {
@@ -983,21 +1091,28 @@ export class Session {
           });
           await sleep(180);
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
       }
 
       case 'press': {
-        const key = String(a.key || '').trim();
-        if (!SAFE_KEY_RE.test(key)) return { error: 'invalid key name' };
+        const keyList = Array.isArray(a.keys) && a.keys.length
+          ? a.keys.map((k) => String(k || '').trim())
+          : [String(a.key || '').trim()];
+        if (keyList.length > 20) return { error: 'keys sequence allows at most 20 keys' };
+        for (const k of keyList) {
+          if (!isValidKeyChord(k)) return { error: 'invalid key name' };
+        }
+
         let box = null;
         if (a.ref) {
           box = this._findBox(a.ref);
           if (!box) return { blocked: true, reason: `unknown ref ${a.ref} — take a snapshot first` };
         }
-        if (/^(Enter|NumpadEnter)$/i.test(key) && (this.dirtyRisk || this.hasPassword)) {
+        const submits = keyList.some((k) => /(?:^|\+)(Enter|NumpadEnter)$/i.test(k));
+        if (submits && (this.dirtyRisk || this.hasPassword)) {
           const verdict = this.policy.inspect({
             op: 'press',
             role: box?.role || '',
@@ -1008,26 +1123,37 @@ export class Session {
           if (verdict.requireApproval) {
             const decision = await this.requestApproval({
               reason: verdict.reason,
-              detail: `press ${key}${box ? ` on ${box.ref} "${box.name}"` : ''}`,
+              detail: `press ${keyList.join(', ')}${box ? ` on ${box.ref} "${box.name}"` : ''}`,
               rule: verdict.rule,
             });
             if (!decision.allow) return { blocked: true, reason: decision.reason };
           }
           this._clearFormTaint();
         }
-        this.addLog('act', `press ${key}${box ? ` on ${box.ref}` : ''}`);
+
+        if (this.recorder.active && !a._skipRecord) {
+          const target = box ? await captureSemanticTarget(page, box) : undefined;
+          this.recorder.record(keyList.length === 1
+            ? { op: 'press', key: keyList[0], ...(target ? { target } : {}) }
+            : { op: 'press', keys: keyList, ...(target ? { target } : {}) });
+        }
+
+        this.addLog('act', `press ${keyList.join(' → ')}${box ? ` on ${box.ref}` : ''}`);
         try {
           if (box) {
             const loc = this._locatorFor(page, box);
             await loc.focus?.({ timeout: 3000 }).catch(() => {});
           }
-          await page.keyboard.press(key);
-          if (/^(Enter|NumpadEnter)$/i.test(key)) {
+          for (const k of keyList) {
+            await page.keyboard.press(k);
+            if (keyList.length > 1) await sleep(35);
+          }
+          if (submits) {
             await page.waitForLoadState?.('domcontentloaded', { timeout: 6000 }).catch(() => {});
           }
           await sleep(180);
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
@@ -1036,6 +1162,9 @@ export class Session {
       case 'hover': {
         const box = this._findBox(a.ref);
         if (!box) return { blocked: true, reason: `unknown ref ${a.ref} — take a snapshot first` };
+        if (this.recorder.active && !a._skipRecord) {
+          this.recorder.record({ op: 'hover', target: await captureSemanticTarget(page, box) });
+        }
         this.addLog('act', `hover ${box.ref} ${box.role} "${box.name}"`);
         try {
           const loc = this._locatorFor(page, box);
@@ -1043,7 +1172,7 @@ export class Session {
           await loc.hover({ timeout: 5000 });
           await sleep(220);
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
@@ -1060,20 +1189,30 @@ export class Session {
             return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
           }
         } else {
-          const dy = Number.isFinite(Number(a.dy)) ? Number(a.dy) : 700;
+          const rawAmount = a.dy !== undefined
+            ? Number(a.dy)
+            : (Number(a.amount || 700) * (a.direction === 'up' ? -1 : 1));
+          const dy = Number.isFinite(rawAmount) ? rawAmount : 700;
           const dx = Number.isFinite(Number(a.dx)) ? Number(a.dx) : 0;
+          if (this.recorder.active && !a._skipRecord) {
+            this.recorder.record({ op: 'scroll', direction: dy < 0 ? 'up' : 'down', amount: Math.abs(dy) });
+          }
           this.addLog('act', `scroll ${dy >= 0 ? 'down' : 'up'} ${Math.abs(dy)}px${dx ? ` (dx=${dx})` : ''}`);
           await page.mouse.wheel(dx, dy).catch(() => {});
         }
         await sleep(220);
         const snap = await this.snap();
-        return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+        return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
       }
 
       case 'wait': {
         const timeout = Math.min(30000, Math.max(100, Math.trunc(Number(a.timeoutMs) || 8000)));
         try {
-          if (typeof a.text === 'string' && a.text.trim()) {
+          if (Number.isFinite(a.ms) && a.ms > 0) {
+            const delay = Math.min(15000, Math.max(10, Math.trunc(a.ms)));
+            this.addLog('act', `wait ${delay}ms`);
+            await sleep(delay);
+          } else if (typeof a.text === 'string' && a.text.trim()) {
             const needle = a.text.trim();
             this.addLog('act', `wait for text ${JSON.stringify(needle.slice(0, 60))}`);
             await page.getByText(needle).first().waitFor({ state: 'visible', timeout });
@@ -1092,8 +1231,16 @@ export class Session {
             this.addLog('act', `wait for load state "${loadState}"`);
             await page.waitForLoadState(loadState, { timeout });
           }
+          if (this.recorder.active && !a._skipRecord && (a.selector || a.text || a.url)) {
+            this.recorder.record({
+              op: 'wait',
+              ...(a.selector ? { selector: a.selector } : {}),
+              ...(a.text ? { text: a.text } : {}),
+              ...(a.url ? { url: a.url } : {}),
+            });
+          }
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: `wait timed out: ${String(e.message || e).split('\n')[0].slice(0, 140)}` };
         }
@@ -1102,12 +1249,27 @@ export class Session {
       case 'extract': {
         const format = a.format ?? 'text';
         const maxChars = a.maxChars ?? 20000;
-        this.addLog('act', `extract ${format} (max ${maxChars} chars)`);
+        const maxPages = Number.isFinite(a.maxPages) ? Math.trunc(Number(a.maxPages)) : 1;
+        this.addLog('act', `extract ${format}${maxPages > 1 ? ` (up to ${maxPages} pages)` : ''}`);
         try {
-          const data = await extractPage(page, format, maxChars);
+          const data = maxPages > 1
+            ? await paginateExtract(this, {
+                format,
+                maxPages,
+                maxChars,
+                schema: a.schema,
+                selector: a.selector,
+                nextSelector: a.nextSelector,
+                gen,
+              })
+            : await extractPage(page, format, {
+                maxChars,
+                schema: a.schema,
+                selector: a.selector,
+              });
           return { ok: true, data };
         } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
+          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
         }
       }
 
@@ -1129,12 +1291,11 @@ export class Session {
         try {
           if (imgType === 'jpeg') {
             const buf = await this.capture({ fullPage: Boolean(a.fullPage), quality: a.quality, annotate });
-            const base64 = buf.toString('base64');
             return {
               ok: true,
               data: {
                 mimeType: 'image/jpeg',
-                base64,
+                base64: buf.toString('base64'),
                 bytes: buf.length,
                 annotated: annotate,
                 shotVersion: this.shotVersion,
@@ -1168,410 +1329,6 @@ export class Session {
         }
       }
 
-      // ---------------- F12 Agent DevTools actions ----------------
-      case 'network': {
-        const dt = tab.devtools;
-        const sub = String(a.sub || a.mode || 'list').toLowerCase();
-        try {
-          if (sub === 'list') {
-            const sinceActionSeq = a.sinceLastAction ? this.lastMutatingActionSeq : null;
-            return {
-              ok: true,
-              data: dt.listNetwork({
-                resourceType: a.resourceType,
-                status: a.status,
-                url: a.url,
-                sinceActionSeq,
-                limit: a.limit,
-              }),
-            };
-          }
-          if (sub === 'get') {
-            if (!a.id) return { error: 'request id required (e.g. r1)' };
-            const entry = dt.getNetworkEntry(a.id, { maxChars: a.maxChars });
-            if (!entry) return { error: `unknown request id: ${a.id}` };
-            return { ok: true, data: entry };
-          }
-          if (sub === 'websockets') {
-            return { ok: true, data: dt.listWebSockets({ wsId: a.wsId, limit: a.limit }) };
-          }
-          if (sub === 'har') {
-            return { ok: true, data: dt.exportHar({ includeBodies: Boolean(a.includeBodies) }) };
-          }
-          if (sub === 'clear') {
-            dt.clearNetwork();
-            this.addLog('devtools', 'network log cleared');
-            return { ok: true, data: { cleared: true } };
-          }
-          if (sub === 'throttle') {
-            const presetName = a.preset ? String(a.preset).toLowerCase() : '';
-            const profileInput = presetName
-              ? presetName
-              : {
-                  offline: Boolean(a.offline),
-                  latencyMs: a.latencyMs ?? 0,
-                  downloadKbps: a.downloadKbps ?? -1,
-                  uploadKbps: a.uploadKbps ?? -1,
-                };
-            if (presetName && !NETWORK_PRESETS[presetName]) {
-              return { error: `unknown throttle preset: ${presetName}` };
-            }
-            const applied = await dt.applyNetworkThrottle(this.ctx, profileInput);
-            this.netControls.networkProfile = { ...applied, preset: presetName || 'custom' };
-            this.netControls.emulation.offline = applied.offline;
-            this.addLog('devtools', `network throttle → ${presetName || JSON.stringify(applied)}`);
-            return { ok: true, data: this.netControls.networkProfile };
-          }
-          if (sub === 'block') {
-            const updated = this.netControls.setBlocked({ patterns: a.patterns, blockTrackers: a.blockTrackers });
-            this.addLog('devtools', `network block updated · trackers=${updated.blockTrackers} · patterns=${updated.blockedPatterns.length}`);
-            return { ok: true, data: updated };
-          }
-          if (sub === 'mock') {
-            const added = this.netControls.addMock({
-              urlPattern: a.urlPattern,
-              method: a.method,
-              status: a.status,
-              contentType: a.contentType,
-              body: a.body,
-              headers: a.headers,
-            });
-            this.addLog('devtools', `network mock added · ${added.method} ${added.urlPattern} → ${added.status}`);
-            return { ok: true, data: added };
-          }
-          if (sub === 'unmock') {
-            const cleared = this.netControls.clearMocks(a.id);
-            this.addLog('devtools', `network mocks cleared · removed=${cleared.removed}`);
-            return { ok: true, data: cleared };
-          }
-          return { error: `unknown network operation: ${sub}` };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'console': {
-        const dt = tab.devtools;
-        const sub = String(a.sub || a.mode || 'list').toLowerCase();
-        if (sub === 'clear') {
-          dt.clearConsole();
-          this.addLog('devtools', 'console log cleared');
-          return { ok: true, data: { cleared: true } };
-        }
-        if (sub !== 'list') return { error: `unknown console operation: ${sub}` };
-        const sinceActionSeq = a.sinceLastAction ? this.lastMutatingActionSeq : null;
-        return {
-          ok: true,
-          data: dt.listConsole({
-            level: a.level,
-            search: a.search,
-            sinceActionSeq,
-            limit: a.limit,
-          }),
-        };
-      }
-
-      case 'evaluate': {
-        if (!this.allowEval) {
-          return {
-            blocked: true,
-            reason: 'browser_evaluate is disabled by default (set AGENT_BROWSER_ALLOW_EVAL=1 for trusted debugging)',
-          };
-        }
-        const expression = String(a.expression || '').trim();
-        if (!expression) return { error: 'expression required' };
-        if (this.policy.approvalsEnabled) {
-          const decision = await this.requestApproval({
-            reason: 'page JavaScript execution',
-            detail: `evaluate JS: ${expression.slice(0, 90)}`,
-            rule: 'evaluate',
-          });
-          if (!decision.allow) return { blocked: true, reason: decision.reason };
-        }
-        this.addLog('devtools', `evaluate JS (${expression.length} chars)`);
-        try {
-          const data = await evaluateExpression(page, expression, { timeoutMs: a.timeoutMs });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 200) };
-        }
-      }
-
-      case 'inspect': {
-        let ref = a.ref ? String(a.ref).trim() : '';
-        const selector = a.selector ? String(a.selector).trim() : '';
-        if (!ref && !selector) return { error: 'provide ref (e.g. e3) or CSS selector' };
-        if (selector.length > 1000) return { error: 'selector too long' };
-        let frame = '';
-        if (ref) {
-          const box = this._findBox(ref);
-          if (!box) return { blocked: true, reason: `unknown ref ${ref} — take a snapshot first` };
-          frame = box.frame || '';
-        }
-        this.addLog('devtools', `inspect ${ref || selector.slice(0, 60)}`);
-        try {
-          const data = await inspectElement(page, { ref, selector, frame });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'a11y': {
-        const ref = a.ref ? String(a.ref).trim() : '';
-        const selector = a.selector ? String(a.selector).trim() : '';
-        let locator = null;
-        if (ref) {
-          const box = this._findBox(ref);
-          if (!box) return { blocked: true, reason: `unknown ref ${ref} — take a snapshot first` };
-          locator = this._locatorFor(page, box);
-        }
-        this.addLog('devtools', `a11y tree ${ref || selector || 'document'}`);
-        try {
-          const data = await captureA11yTree(page, { locator, ref, selector, maxChars: a.maxChars });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'diff': {
-        const sub = String(a.sub || a.mode || 'diff').toLowerCase();
-        if (sub === 'mark') {
-          const snap = this.snapshot || (await this.snap());
-          this.markedSnapshot = snap;
-          await readToasts(page, { clear: true });
-          this.addLog('devtools', 'diff checkpoint marked');
-          return { ok: true, data: { marked: true, url: snap?.meta?.url || '', controls: snap?.boxes?.length || 0 } };
-        }
-        const before = a.sinceMark && this.markedSnapshot ? this.markedSnapshot : this.prevSnapshot;
-        const fresh = a.refresh ? await this.snap() : (this.snapshot || (await this.snap()));
-        const baseline = a.refresh && !a.sinceMark ? this.prevSnapshot : before;
-        const rawToasts = await readToasts(page, { clear: Boolean(a.clearToasts) });
-        const toasts = Array.isArray(rawToasts) ? rawToasts : [];
-        return { ok: true, data: diffSnapshots(baseline, fresh, toasts) };
-      }
-
-      case 'perf': {
-        this.addLog('devtools', 'collect performance metrics');
-        try {
-          const cdp = await tab.devtools.ensureCdp(this.ctx);
-          const data = await collectPerformance(page, { cdp });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'audit': {
-        this.addLog('devtools', 'run page audit');
-        try {
-          const cdp = await tab.devtools.ensureCdp(this.ctx);
-          const data = await runPageAudit(page, { tabDevtools: tab.devtools, cdp });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'storage': {
-        const sub = String(a.sub || a.mode || 'inspect').toLowerCase();
-        try {
-          if (sub === 'clear') {
-            if (this.policy.approvalsEnabled) {
-              const decision = await this.requestApproval({
-                reason: 'clear browser storage/cookies',
-                detail: `clear storage [${(a.targets || ['cookies', 'localStorage', 'sessionStorage']).join(', ')}]`,
-                rule: 'destructive',
-              });
-              if (!decision.allow) return { blocked: true, reason: decision.reason };
-            }
-            const res = await clearStorage(page, this.ctx, a.targets);
-            this.addLog('devtools', `storage cleared · [${res.cleared.join(', ')}]`);
-            return { ok: true, data: res };
-          }
-          if (sub !== 'inspect') return { error: `unknown storage operation: ${sub}` };
-          const includeValues = Boolean(a.includeValues && this.allowSensitiveStorage);
-          const data = await inspectStorage(page, this.ctx, { includeValues });
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'security': {
-        this.addLog('devtools', 'inspect page security & third-party requests');
-        try {
-          const data = await inspectSecurity(page, this.ctx, tab.devtools);
-          return { ok: true, data };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'emulate': {
-        try {
-          const emu = this.netControls.emulation;
-          let targetViewport = null;
-          let targetUa = a.userAgent !== undefined ? String(a.userAgent) : null;
-          let deviceScaleFactor = 1;
-          let mobile = false;
-
-          if (a.device) {
-            const preset = DEVICE_PRESETS[String(a.device).toLowerCase()];
-            if (!preset) return { error: `unknown device preset: ${a.device} (use ${Object.keys(DEVICE_PRESETS).join(', ')})` };
-            emu.device = preset.name;
-            targetViewport = { ...preset.viewport };
-            deviceScaleFactor = preset.deviceScaleFactor;
-            mobile = preset.mobile;
-            if (targetUa === null && preset.userAgent) targetUa = preset.userAgent;
-          }
-
-          if (a.viewport && typeof a.viewport === 'object') {
-            targetViewport = parseViewport(a.viewport);
-            if (!a.device) emu.device = 'custom';
-          } else if (Number.isFinite(a.width) && Number.isFinite(a.height)) {
-            targetViewport = parseViewport({ width: a.width, height: a.height });
-            if (!a.device) emu.device = 'custom';
-          }
-
-          if (targetViewport) {
-            await page.setViewportSize?.(targetViewport);
-            this.viewport = targetViewport;
-            emu.viewport = targetViewport;
-          }
-
-          const cdp = await tab.devtools.ensureCdp(this.ctx);
-          if (cdp && (a.device || targetUa !== null || a.timezoneId)) {
-            if (a.device && targetViewport) {
-              await cdp.send('Emulation.setDeviceMetricsOverride', {
-                width: targetViewport.width,
-                height: targetViewport.height,
-                deviceScaleFactor,
-                mobile,
-              }).catch(() => {});
-              await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: mobile }).catch(() => {});
-            }
-            if (targetUa !== null && targetUa !== '') {
-              await cdp.send('Emulation.setUserAgentOverride', { userAgent: targetUa }).catch(() => {});
-            }
-            if (a.timezoneId) {
-              const tz = String(a.timezoneId).trim();
-              if (!/^[A-Za-z0-9_/+.-]{2,64}$/.test(tz)) return { error: 'invalid timezoneId' };
-              await cdp.send('Emulation.setTimezoneOverride', { timezoneId: tz });
-              emu.timezoneId = tz;
-            }
-          }
-
-          const mediaPatch = {};
-          if (a.colorScheme) {
-            if (!['light', 'dark', 'no-preference'].includes(a.colorScheme)) return { error: 'invalid colorScheme' };
-            mediaPatch.colorScheme = a.colorScheme;
-            emu.colorScheme = a.colorScheme;
-          }
-          if (a.reducedMotion) {
-            if (!['reduce', 'no-preference'].includes(a.reducedMotion)) return { error: 'invalid reducedMotion' };
-            mediaPatch.reducedMotion = a.reducedMotion;
-            emu.reducedMotion = a.reducedMotion;
-          }
-          if (a.media) {
-            if (!['screen', 'print'].includes(a.media)) return { error: 'invalid media type' };
-            mediaPatch.media = a.media;
-            emu.media = a.media;
-          }
-          if (Object.keys(mediaPatch).length) {
-            await page.emulateMedia?.(mediaPatch);
-          }
-
-          if (typeof a.offline === 'boolean') {
-            await this.ctx.setOffline?.(a.offline);
-            emu.offline = a.offline;
-            this.netControls.networkProfile.offline = a.offline;
-          }
-
-          if (a.geolocation && typeof a.geolocation === 'object') {
-            const lat = Number(a.geolocation.latitude);
-            const lng = Number(a.geolocation.longitude);
-            const acc = a.geolocation.accuracy !== undefined ? Math.max(0, Number(a.geolocation.accuracy)) : 50;
-            if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
-              return { error: 'invalid geolocation coordinates' };
-            }
-            await this.ctx.grantPermissions?.(['geolocation']).catch(() => {});
-            await this.ctx.setGeolocation?.({ latitude: lat, longitude: lng, accuracy: acc });
-            emu.geolocation = { latitude: lat, longitude: lng, accuracy: acc };
-          }
-
-          this.addLog('devtools', `emulate updated · device=${emu.device || 'default'} · ${this.viewport.width}×${this.viewport.height} · ${emu.colorScheme}`);
-          const snap = await this.snap();
-          return { ok: true, data: { emulation: { ...emu, viewport: this.viewport }, snapshot: toWireSnapshot(snap, wireOpts) } };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
-      case 'dialog': {
-        const dt = tab.devtools;
-        const sub = String(a.sub || a.mode || 'list').toLowerCase();
-        if (sub === 'list') {
-          return {
-            ok: true,
-            data: {
-              rule: { ...dt.dialogRule },
-              pending: dt.pendingDialog ? dt.pendingDialog.record : null,
-              dialogs: [...dt.dialogs],
-            },
-          };
-        }
-        if (sub === 'set') {
-          const action = String(a.action || 'dismiss').toLowerCase();
-          if (!['accept', 'dismiss', 'manual'].includes(action)) {
-            return { error: 'dialog action must be accept, dismiss, or manual' };
-          }
-          dt.dialogRule = {
-            mode: action,
-            promptText: a.promptText !== undefined ? String(a.promptText) : '',
-            once: Boolean(a.once),
-          };
-          this.addLog('devtools', `dialog rule → ${action}${dt.dialogRule.once ? ' (once)' : ''}`);
-          return { ok: true, data: { rule: { ...dt.dialogRule } } };
-        }
-        if (sub === 'accept' || sub === 'dismiss') {
-          if (!dt.pendingDialog) return { error: 'no pending dialog' };
-          const id = dt.pendingDialog.id;
-          await dt.pendingDialog.decide(sub === 'accept', a.promptText);
-          return { ok: true, data: { id, action: sub === 'accept' ? 'accepted' : 'dismissed' } };
-        }
-        if (sub === 'clear') {
-          dt.dialogs = [];
-          return { ok: true, data: { cleared: true } };
-        }
-        return { error: `unknown dialog operation: ${sub}` };
-      }
-
-      case 'trace': {
-        const sub = String(a.sub || a.mode || 'status').toLowerCase();
-        try {
-          if (sub === 'status') return { ok: true, data: this.netControls.traceStatus() };
-          if (sub === 'start') {
-            const started = await this.netControls.startTrace(this.ctx, {
-              screenshots: a.screenshots !== false,
-              snapshots: a.snapshots !== false,
-              sources: Boolean(a.sources),
-            });
-            this.addLog('devtools', 'Playwright trace recording started');
-            return { ok: true, data: started };
-          }
-          if (sub === 'stop') {
-            const stopped = await this.netControls.stopTrace(this.ctx, this.id);
-            this.addLog('devtools', `Playwright trace saved → ${stopped.path} (${stopped.bytes} bytes)`);
-            return { ok: true, data: stopped };
-          }
-          return { error: `unknown trace operation: ${sub}` };
-        } catch (e) {
-          return { error: String(e.message || e).split('\n')[0].slice(0, 180) };
-        }
-      }
-
       case 'upload': {
         const box = this._findBox(a.ref);
         if (!box) return { blocked: true, reason: `unknown ref ${a.ref} — take a snapshot first` };
@@ -1596,7 +1353,7 @@ export class Session {
           await loc.setInputFiles(resolved, { timeout: 6000 });
           await sleep(180);
           const snap = await this.snap();
-          return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+          return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
         } catch (e) {
           return { error: String(e.message || e).split('\n')[0].slice(0, 160) };
         }
@@ -1604,21 +1361,23 @@ export class Session {
 
       case 'back':
       case 'forward': {
-        this.addLog('act', a.op);
+        this.addLog('act', op);
+        if (this.recorder.active && !a._skipRecord) this.recorder.record({ op });
         this._clearFormTaint();
-        await (a.op === 'back' ? page.goBack({ timeout: 15000 }) : page.goForward({ timeout: 15000 })).catch(() => {});
+        await (op === 'back' ? page.goBack({ timeout: 15000 }) : page.goForward({ timeout: 15000 })).catch(() => {});
         await sleep(220);
         const snap = await this.snap();
-        return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+        return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
       }
 
       case 'reload': {
         this.addLog('act', 'reload');
+        if (this.recorder.active && !a._skipRecord) this.recorder.record({ op: 'reload' });
         this._clearFormTaint();
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
         await sleep(200);
         const snap = await this.snap();
-        return { ok: true, snapshot: toWireSnapshot(snap, wireOpts) };
+        return { ok: true, snapshot: this.formatWireSnapshot(snap, wireOpts) };
       }
 
       default:
@@ -1635,7 +1394,6 @@ export class Session {
       if (!document.body) {
         return { title: document.title || '', url: location.href, text: '', length: 0, truncated: false };
       }
-      // Boundary-safe chrome selectors (avoids naive `[class*=nav]` hitting words like "coronavirus" or "unavailable").
       const JUNK = [
         'nav', 'header', 'footer', 'aside',
         '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]',
@@ -1672,7 +1430,7 @@ export class Session {
     }, cap);
   }
 
-  // ---------- multi-engine SERP extractor (SearXNG, DuckDuckGo, Bing, Brave, Google) ----------
+  // ---------- multi-engine SERP extractor ----------
   async results() {
     const page = this.active();
     if (!page) return [];
@@ -1686,10 +1444,8 @@ export class Session {
       const unwrapUrl = (href) => {
         try {
           const u = new URL(href, location.href);
-          // DuckDuckGo redirect wrapper: /l/?uddg=<encoded>
           const uddg = u.searchParams.get('uddg');
           if (uddg && /^https?:\/\//i.test(uddg)) return uddg;
-          // Bing redirect wrapper: ?u=a1<base64url>
           const raw = u.searchParams.get('u');
           if (raw && raw.startsWith('a1') && /bing\.com$/i.test(u.hostname)) {
             let b = raw.slice(2).replace(/-/g, '+').replace(/_/g, '/');
@@ -1724,14 +1480,11 @@ export class Session {
         out.push({ title: t, url, snippet: clean(snippet).slice(0, 360) });
       };
 
-      // 1) SearXNG
       for (const art of document.querySelectorAll('article.result')) {
         const a = art.querySelector('h3 a, h4 a, a.url_header, a[href^="http"]');
         const sn = art.querySelector('p.content, .content, p');
         if (a) add(a.innerText || a.textContent, a.href, sn ? (sn.innerText || sn.textContent) : '');
       }
-
-      // 2) DuckDuckGo (HTML & JS editions)
       if (!out.length) {
         for (const res of document.querySelectorAll('.result, .results_links, article[data-testid="result"]')) {
           const a = res.querySelector('a.result__a, a[data-testid="result-title-a"], h2 a');
@@ -1739,8 +1492,6 @@ export class Session {
           if (a) add(a.innerText || a.textContent, a.href, sn ? (sn.innerText || sn.textContent) : '');
         }
       }
-
-      // 3) Bing
       if (!out.length) {
         for (const li of document.querySelectorAll('li.b_algo, div.b_algo, #b_results > li')) {
           const a = li.querySelector('h2 a, a[href^="http"]');
@@ -1748,8 +1499,6 @@ export class Session {
           if (a) add(a.innerText || a.textContent, a.href, sn ? (sn.innerText || sn.textContent) : li.innerText);
         }
       }
-
-      // 4) Brave Search
       if (!out.length) {
         for (const snp of document.querySelectorAll('#results .snippet, div[data-type="web"]')) {
           const a = snp.querySelector('a[href^="http"]');
@@ -1758,8 +1507,6 @@ export class Session {
           if (a && titleEl) add(titleEl.innerText || titleEl.textContent, a.href, descEl ? (descEl.innerText || descEl.textContent) : '');
         }
       }
-
-      // 5) Google
       if (!out.length) {
         for (const g of document.querySelectorAll('div.g, div.MjjYud')) {
           const a = g.querySelector('a[href^="http"]');
@@ -1767,8 +1514,6 @@ export class Session {
           if (a && h) add(h.innerText || h.textContent, a.href, g.innerText || g.textContent);
         }
       }
-
-      // 6) Generic fallback
       if (!out.length) {
         for (const a of document.querySelectorAll('a[href^="http"]')) {
           const t = clean(a.innerText || a.textContent);
@@ -1777,7 +1522,6 @@ export class Session {
           add(t.slice(0, 110), a.href, '');
         }
       }
-
       return out;
     }).catch(() => []);
   }
@@ -1795,6 +1539,9 @@ export class Session {
       this.sessionActions = 0;
       this.lastMutatingActionSeq = 0;
       this.netControls = new ContextNetworkControls({ traceDir: this.traceDir });
+      this.recorder = new WorkflowRecorder();
+      this.visualBaselines.clear();
+      this._clipboardText = '';
       this.stats = { actions: 0, snapshots: 0, tokens: 0, htmlBytes: 0, approvals: 0, taskRuns: 0 };
       this.downloads = [];
       this.agentStatus = 'idle';

@@ -1,0 +1,47 @@
+services:
+  agentbrowser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentbrowser:2.0.0
+    init: true
+    restart: unless-stopped
+    # Sufficient shared memory prevents Chromium renderer OOM crashes on complex SPAs.
+    shm_size: "1gb"
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-3000}:3000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      # Required when binding to 0.0.0.0 — set a strong secret before running `docker compose up`.
+      AGENT_BROWSER_TOKEN: "${AGENT_BROWSER_TOKEN:?Set AGENT_BROWSER_TOKEN to a strong random secret}"
+      ALLOW_PRIVATE_NETWORKS: "${ALLOW_PRIVATE_NETWORKS:-0}"
+      AGENT_BROWSER_ALLOW_EVAL: "${AGENT_BROWSER_ALLOW_EVAL:-0}"
+      AGENT_BROWSER_MAX_SESSIONS: "${AGENT_BROWSER_MAX_SESSIONS:-8}"
+      AGENT_BROWSER_SESSION_TTL_MS: "${AGENT_BROWSER_SESSION_TTL_MS:-1800000}"
+      AGENT_BROWSER_PROXY: "${AGENT_BROWSER_PROXY:-}"
+      AGENT_BROWSER_UPLOAD_DIR: "/data/uploads"
+      AGENT_BROWSER_DOWNLOAD_DIR: "/data/downloads"
+      AGENT_BROWSER_TRACE_DIR: "/data/traces"
+      AGENT_BROWSER_WORKFLOW_DIR: "/data/workflows"
+    volumes:
+      - ab_uploads:/data/uploads:ro
+      - ab_downloads:/data/downloads
+      - ab_traces:/data/traces
+      - ab_workflows:/data/workflows
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/pwuser/.cache:size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN # Allows Chromium user/PID sandbox inside Docker without --no-sandbox
+
+volumes:
+  ab_uploads:
+  ab_downloads:
+  ab_traces:
+  ab_workflows:

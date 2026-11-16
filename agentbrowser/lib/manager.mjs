@@ -5,6 +5,7 @@
 import crypto from 'node:crypto';
 import { chromium } from 'playwright';
 import { Session, defaultLaunchOptions } from './session.mjs';
+import { WorkflowStore } from './workflow.mjs';
 
 export const SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 export const DEFAULT_MAX_SESSIONS = Number(process.env.AGENT_BROWSER_MAX_SESSIONS ?? 8);
@@ -24,7 +25,11 @@ export class SessionManager {
   constructor(opts = {}) {
     this._browserLauncher = opts.browserLauncher || ((launchOpts) => chromium.launch(launchOpts));
     this._launchOpts = defaultLaunchOptions(opts);
-    this._sessionDefaults = opts.sessionDefaults || {};
+    this._sessionDefaults = opts.sessionDefaults || opts.sessionOptions || {};
+    this.metrics = opts.metrics || this._sessionDefaults.metrics || null;
+    this.workflowStore = opts.workflowStore
+      || this._sessionDefaults.workflowStore
+      || new WorkflowStore({ workflowDir: opts.workflowDir ?? this._sessionDefaults.workflowDir ?? process.env.AGENT_BROWSER_WORKFLOW_DIR ?? '' });
     this.maxSessions = Number.isFinite(opts.maxSessions) && opts.maxSessions > 0
       ? Math.trunc(opts.maxSessions)
       : DEFAULT_MAX_SESSIONS;
@@ -96,6 +101,8 @@ export class SessionManager {
     );
     return new Session({
       ...this._sessionDefaults,
+      metrics: this.metrics,
+      workflowStore: this.workflowStore,
       ...cleanOverrides,
       id,
       getBrowser: () => this.ensureBrowser(),
@@ -142,8 +149,11 @@ export class SessionManager {
       timezoneId: opts.timezoneId,
       colorScheme: opts.colorScheme,
       userAgent: opts.userAgent,
+      proxy: opts.proxy,
+      deltaMode: opts.deltaMode,
     });
     this.sessions.set(id, session);
+    this.metrics?.recordSessionCreated?.();
     return session;
   }
 

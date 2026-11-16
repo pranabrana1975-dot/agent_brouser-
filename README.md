@@ -1,12 +1,12 @@
-# AgentBrowser
+# AgentBrowser v2.0
 
-Headless Chromium control plane, **Agent DevTools ("F12 for Agents")**, one-shot CLI, JavaScript SDK, and Model Context Protocol (MCP) server built specifically for AI agents — turning live web pages into compact, deterministic **Agent Documents** (`e1..eN` refs + accessible labels + control states + live DevTools diagnostics) instead of raw pixels or bloated HTML.
+Complete AI browser platform: hardened headless Chromium control plane, **Live Supervisor Mission Control & Human Takeover UI (`/dashboard`)**, **Batch & Zero-Token Workflow Record/Replay + Playwright Codegen**, **Agent DevTools ("F12 for Agents")**, **Autonomous Browser Agent v2 & Schema Scraper**, zero-dependency **JavaScript/TypeScript SDK**, one-shot **CLI**, **Full MCP Server** (37 Tools + Resources + Prompts + Delta Snapshots), **Prometheus `/metrics`**, and production **Docker** setup.
 
 বিস্তারিত বাংলা ডকুমেন্টেশনের জন্য দেখুন: **[`agentbrowser/README.md`](./agentbrowser/README.md)**।
 
 ## Quick Start
 
-Requires **Node.js 20+**.
+Requires **Node.js 20+** (or Docker).
 
 ```sh
 npm run setup
@@ -14,35 +14,37 @@ npx --prefix agentbrowser playwright install chromium
 npm start
 ```
 
-The control plane listens on `http://127.0.0.1:3000` by default (Streamable HTTP MCP at `http://127.0.0.1:3000/mcp`). Run standalone over MCP stdio or inspect any page straight from the shell:
+By default `server.mjs` listens on `http://127.0.0.1:3000`:
+- **Live Mission Control & Human Takeover UI:** `http://127.0.0.1:3000/dashboard`
+- **Streamable HTTP MCP:** `http://127.0.0.1:3000/mcp`
+- **Prometheus Metrics:** `http://127.0.0.1:3000/metrics` (JSON summary: `/api/metrics`)
+
+Run standalone over MCP stdio, scrape paginated pages, or export PDFs straight from the shell:
 
 ```sh
 npm run mcp:embedded
-npm run fetch -- https://example.com --dump audit
+npm run fetch -- https://news.ycombinator.com --dump items --max-pages 2
+npm run fetch -- https://example.com --dump pdf > page.pdf
 npm run inspect -- https://example.com --selector main
 ```
 
-## Agent DevTools ("F12 for Agents")
+### Docker Compose (Production)
 
-Alongside the 17 core browsing tools, AgentBrowser ships 13 built-in DevTools tools (30 total across HTTP, SDK, CLI, and MCP):
+```sh
+AGENT_BROWSER_TOKEN="$(openssl rand -hex 32)" docker compose up --build -d
+```
 
-1. **Network (`browser_network`):** Ring-buffered HTTP/XHR/Fetch log (`r1..rN`), response body/JSON/header/query inspection, WebSocket connection & frame inspector (`ws1..wsN`), HAR 1.2 export, network throttling (`offline`, `slow-3g`, `fast-3g`, `4g`, `online`), ad/tracker & URL pattern blocker, and QA API route mocks — with automatic `[REDACTED]` masking of auth headers, cookies, secret query params, and password payloads.
-2. **Console & Gated Eval (`browser_console`, `browser_evaluate`):** Captures `console.*` messages and uncaught `pageerror` stack traces with level & `sinceLastAction` filters, injects a 1-line `[devtools]` anomaly badge into snapshots only when errors/failed requests/toasts occur, and keeps `browser_evaluate` disabled by default (`AGENT_BROWSER_ALLOW_EVAL=1` + human approval gate).
-3. **Elements, Accessibility & Diff (`browser_inspect`, `browser_a11y`, `browser_diff`):** Inspects any `eN` ref or CSS selector (tag, redacted attributes, DOM path, HTML snippet, box model, computed CSS, and `elementFromPoint` click-occlusion diagnosis), dumps the full ARIA accessibility tree, tracks snapshot DOM diffs (`+`/`-`/`~`), and catches ephemeral toast/alert banners via `MutationObserver`.
-4. **Performance, Audit & Trace (`browser_perf`, `browser_audit`, `browser_trace`):** Core Web Vitals (`TTFB`, `FCP`, `LCP`, `CLS`, `DOMContentLoaded`, `Load`), slowest resources, DOM depth, and CDP `Performance.getMetrics` (JS heap, DOM nodes, layouts, style recalcs); single-call page audit across accessibility, SEO, security, and reliability; and Playwright `.zip` trace recording.
-5. **Storage & Security (`browser_storage`, `browser_security`):** Inspects and selectively clears cookies, `localStorage`, `sessionStorage`, `IndexedDB`, Service Workers, and Cache Storage (masking cookie values and sensitive storage keys by default); inspects TLS certificates, CSP/HSTS/X-Frame-Options security headers, mixed content, insecure forms/cookies, and third-party tracker domains.
-6. **Emulation, Set-of-Mark Overlay, Dialogs & Structured Extract (`browser_emulate`, `browser_screenshot({ annotate: true })`, `browser_dialog`, `browser_extract`):** Device presets (`iphone-15`, `pixel-8`, `ipad`, `desktop`, `desktop-hd`), dark/light mode, reduced motion, print media, offline mode, geolocation & timezone emulation; `[eN]` Set-of-Mark annotated screenshots for vision models; JS `alert`/`confirm`/`prompt` history and rules; plus `tables` and `metadata` (OpenGraph, Twitter Card, JSON-LD, feeds) extraction.
+Runs as non-root `pwuser` with `shm_size: "1gb"`, `read_only: true`, `no-new-privileges`, `/api/health` healthcheck, and jailed volumes for `/data/{uploads,downloads,traces,workflows}`.
 
-## Project Layout
+## What's in v2.0 (37 Tools + Full MCP + Mission Control)
 
-- `agentbrowser/server.mjs` — Hardened HTTP control plane, SSE event stream, DevTools REST endpoints, multi-session routes, and Streamable HTTP MCP (`/mcp`)
-- `agentbrowser/mcp.mjs` & `agentbrowser/lib/mcp-handler.mjs` — MCP JSON-RPC 2.0 dispatcher (remote stdio, embedded stdio, and HTTP)
-- `agentbrowser/cli.mjs` & `agentbrowser/lib/extract.mjs` — One-shot shell CLI (`fetch` + `inspect`) and structured extractor (`text`, `html`, `markdown`, `links`, `forms`, `tables`, `metadata`)
-- `agentbrowser/sdk.mjs` & `agentbrowser/tools.mjs` — Zero-dependency JavaScript SDK and 30 shared agent/DevTools tool schemas
-- `agentbrowser/lib/devtools.mjs` & `agentbrowser/lib/inspector.mjs` — Network/WS/HAR/console/dialog/mock/trace engine and DOM/CSS/a11y/diff/perf/audit/storage/security/overlay inspectors
-- `agentbrowser/lib/snapshot.mjs` — Viewport/modal/main-prioritized Agent Document generator with Shadow DOM, same-origin iframes, and live `[devtools]` anomaly badge
-- `agentbrowser/lib/session.mjs`, `agentbrowser/lib/manager.mjs`, `agentbrowser/lib/policy.mjs`, `agentbrowser/lib/agent.mjs` — Multi-session isolation, SSRF & approval guardrails, and multi-engine English/Bangla research planner
-- `agentbrowser/test/` & `.github/workflows/ci.yml` — Unit, DevTools, mock-DOM, HTTP/MCP/SSE integration, and Playwright Chromium E2E tests across Node 20 & 22
+1. **Live Supervisor Dashboard & Human Takeover (`/dashboard`, `POST /api/takeover`):** Zero-dependency dark Mission Control UI with live viewport (including `[eN]` Set-of-Mark overlays), 1-click **Approve / Deny** banners for gated actions, **Human Takeover** mode (pause agent, click/drag/scroll/type masked OTP/2FA/CAPTCHA directly, then seamlessly resume held agent actions), multi-session switcher (with per-session proxy), live workflow recorder/replayer, and Timeline / Network / Console / Audit / Snapshot / Workflows panels.
+2. **Batch Actions, Workflow Recorder, Replay & Playwright Codegen (`browser_batch`, `browser_workflow`):** Execute multi-step sequences in a single LLM round-trip with automatic semantic ref re-binding and instant stop on error, navigation, or denied approval. Record semantic `role + label + CSS fallback` workflows to jailed `.workflow.json` files (auto-converting passwords/secrets into `{{secret_N}}` variables), replay them at **0 LLM tokens** with `{{variable}}` interpolation, or export clean `@playwright/test` `*.spec.mjs` files.
+3. **Advanced Interaction, Cross-Origin Iframes, PDF, Download Inspector & Visual Diff (`browser_drag`, `browser_click`, `browser_press`, `browser_clipboard`, `browser_pdf`, `browser_downloads`, `browser_visual_diff`):** Kanban/slider drag-and-drop, `dblclick`, right-click, modifier chords, multi-key sequences, approval-gated clipboard access, cross-origin `<iframe>` discovery (`frame=fN:xorigin`) & FrameLocator routing, PDF generation with SHA-256 & page count, jailed download artifact inspection (CSV/TSV/JSON/JSONL/text/PDF/PNG previews with secret redaction), and zero-dependency YIQ perceptual PNG visual regression diffing (diff %, bounding box, hotspots, and highlighted diff PNG).
+4. **Autonomous Browser Agent v2 & Schema/Paginated Scraper (`browser_task`, `browser_extract`):** Full **Observe → Plan → Act → Verify** loop supporting multi-field form filling, proactive & reactive modal/cookie-banner occlusion self-healing, DOM-diff verification, optional OpenAI-compatible LLM planner, plus existing grounded English/Bangla multi-engine research. `browser_extract` adds auto-detected `items` cards, typed CSS `schema` extraction (`string`, `number`, `boolean`, `url`, `list`), and automatic multi-page `Next` pagination (`maxPages`).
+5. **Agent DevTools — "F12 for Agents" (13 tools):** `browser_network` (XHR/Fetch/WS/HAR/throttle/block/mock), `browser_console`, `browser_evaluate` (disabled by default + approval-gated), `browser_inspect` (box model, computed CSS, click occlusion), `browser_a11y`, `browser_diff`, `browser_perf` (Core Web Vitals + CDP metrics), `browser_audit`, `browser_storage`, `browser_security`, `browser_emulate`, `browser_dialog`, and `browser_trace`.
+6. **Full MCP Spec & Delta Snapshots (`mcp.mjs`, `lib/mcp-handler.mjs`, `lib/snapshot.mjs`):** Supports `tools/list` & `tools/call` (37 tools), `resources/list`, `resources/templates/list` & `resources/read` (`browser://snapshot`, `browser://state`, `browser://console`, `browser://network`, `browser://network/{id}`, `browser://network/har`, `browser://screenshot`, `browser://devtools`, `browser://workflows`, `browser://workflows/{name}`, `browser://workflows/{name}/playwright`, `browser://downloads`, `browser://downloads/{id}`, `browser://trace`), `prompts/list` & `prompts/get` (`qa_audit`, `security_review`, `research_topic`, `scrape_structured`, `record_workflow`), and compact `delta: true` snapshots showing only `+added / ~changed / -removed` elements.
+7. **TypeScript, Observability & Per-Session Proxies (`sdk.d.ts`, `tools.d.ts`, `lib/metrics.mjs`):** Complete TypeScript definitions for `AgentBrowser` and all 37 tools, Prometheus histograms/counters/gauges on `/metrics`, SSRF-checked per-session HTTP/HTTPS/SOCKS5 proxies with credential redaction, and modularized session internals (`lib/session.mjs` + `lib/session-ops.mjs`).
 
 ## Testing
 

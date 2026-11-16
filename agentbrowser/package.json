@@ -1,21 +1,31 @@
 {
   "name": "agentbrowser",
-  "version": "1.2.0",
-  "description": "Headless browser control plane, F12 Agent DevTools, CLI, JavaScript SDK, and MCP tools for AI agents",
+  "version": "2.0.0",
+  "description": "AI browser platform: headless Chromium control plane, Live Mission Control & Human Takeover UI, batch & workflow replay/Playwright codegen, F12 DevTools, JS/TS SDK, CLI, and full MCP server",
   "type": "module",
-  "main": "server.mjs",
-  "bin": {
-    "agentbrowser": "./cli.mjs"
-  },
+  "main": "./sdk.mjs",
+  "types": "./sdk.d.ts",
   "exports": {
-    ".": "./sdk.mjs",
-    "./sdk": "./sdk.mjs",
-    "./server": "./server.mjs",
-    "./tools": "./tools.mjs",
-    "./mcp": "./mcp.mjs"
+    ".": {
+      "types": "./sdk.d.ts",
+      "import": "./sdk.mjs"
+    },
+    "./sdk": {
+      "types": "./sdk.d.ts",
+      "import": "./sdk.mjs"
+    },
+    "./tools": {
+      "types": "./tools.d.ts",
+      "import": "./tools.mjs"
+    },
+    "./server": "./server.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "bin": {
+    "agentbrowser": "./cli.mjs",
+    "agentbrowser-mcp": "./mcp.mjs"
   },
   "scripts": {
     "start": "node server.mjs",
@@ -24,15 +34,15 @@
     "fetch": "node cli.mjs fetch",
     "inspect": "node cli.mjs inspect",
     "test": "node --test",
-    "test:unit": "node --test test/core.test.mjs test/extract.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs test/devtools.test.mjs",
+    "test:unit": "node --test test/core.test.mjs test/extract.test.mjs test/snapshot.test.mjs test/agent.test.mjs test/server.test.mjs test/devtools.test.mjs test/v2.test.mjs",
     "test:e2e": "node --test test/e2e.test.mjs test/browser.integration.test.mjs"
   },
   "dependencies": {
-    "playwright": "^1.65.1",
-    "turndown": "^7.2.5"
+    "playwright": "^1.59.1",
+    "turndown": "^7.2.0"
   },
   "devDependencies": {
-    "jsdom": "^26.1.0"
+    "jsdom": "^29.0.2"
   },
   "license": "MIT"
 }

@@ -12,7 +12,9 @@ import { envFlag } from './lib/policy.mjs';
 import { SessionManager } from './lib/manager.mjs';
 import {
   createSdkExecutor,
+  createSdkResourceReader,
   createSessionExecutor,
+  createSessionResourceReader,
   dispatchMcpMessage,
 } from './lib/mcp-handler.mjs';
 
@@ -21,16 +23,20 @@ const sessionId = process.env.AGENT_BROWSER_SESSION || 'default';
 
 let manager = null;
 let invokeTool;
+let readResource;
 
 if (embedded) {
   manager = new SessionManager({ maxSessions: 2, idleTtlMs: 0 });
-  invokeTool = createSessionExecutor(() => manager.getOrCreate(sessionId));
+  const getSession = () => manager.getOrCreate(sessionId);
+  invokeTool = createSessionExecutor(getSession);
+  readResource = createSessionResourceReader(getSession);
 } else {
   const browser = new AgentBrowser(process.env.AGENT_BROWSER_URL || 'http://127.0.0.1:3000', {
     token: process.env.AGENT_BROWSER_TOKEN,
     sessionId: process.env.AGENT_BROWSER_SESSION || '',
   });
   invokeTool = createSdkExecutor(browser);
+  readResource = createSdkResourceReader(browser);
 }
 
 const send = (message) => {
@@ -73,7 +79,7 @@ rl.on('line', (line) => {
     inFlight.add(errJob);
     return;
   }
-  const job = dispatchMcpMessage(parsed, invokeTool)
+  const job = dispatchMcpMessage(parsed, invokeTool, { readResource })
     .then(send)
     .catch((e) => {
       send({ jsonrpc: '2.0', id: parsed?.id ?? null, error: { code: -32603, message: String(e.message || e) } });

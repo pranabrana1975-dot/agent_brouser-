@@ -1,4 +1,5 @@
-// server.mjs — AgentBrowser headless HTTP control plane + Streamable HTTP MCP.
+// server.mjs — AgentBrowser v2.0 HTTP control plane, Live Supervisor Dashboard (/dashboard),
+// Human Takeover API (/api/takeover), Prometheus metrics (/metrics), & Streamable HTTP MCP (/mcp).
 
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -8,7 +9,13 @@ import { tools } from './tools.mjs';
 import { SessionManager, validateSessionId } from './lib/manager.mjs';
 import { isLoopbackHost } from './lib/policy.mjs';
 import { runTask } from './lib/agent.mjs';
-import { createSessionExecutor, dispatchMcpMessage } from './lib/mcp-handler.mjs';
+import { MetricsRegistry } from './lib/metrics.mjs';
+import { renderDashboardHtml, DASHBOARD_CSP } from './lib/dashboard.mjs';
+import {
+  createSessionExecutor,
+  createSessionResourceReader,
+  dispatchMcpMessage,
+} from './lib/mcp-handler.mjs';
 
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 
@@ -24,7 +31,6 @@ export function verifyBearerToken(authHeader, expectedToken) {
   if (!expectedToken) return true;
   if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) return false;
   const provided = authHeader.slice(7);
-  // Compare fixed-length SHA-256 digests so timing leaks neither content nor token length.
   const a = crypto.createHash('sha256').update(provided, 'utf8').digest();
   const b = crypto.createHash('sha256').update(expectedToken, 'utf8').digest();
   return crypto.timingSafeEqual(a, b);
@@ -82,8 +88,7 @@ async function readJsonBody(req, maxBytes = DEFAULT_MAX_BODY_BYTES) {
   const raw = Buffer.concat(chunks).toString('utf8');
   if (!raw.trim()) return {};
   try {
-    const parsed = JSON.parse(raw);
-    return parsed;
+    return JSON.parse(raw);
   } catch {
     throw new HttpError(400, 'invalid JSON body');
   }
@@ -106,10 +111,13 @@ export function createControlServer(opts = {}) {
     ? opts.maxBodyBytes
     : DEFAULT_MAX_BODY_BYTES;
   const taskOptions = opts.taskOptions || {};
+  const enableDashboard = opts.enableDashboard !== false;
 
   assertSafeBind(host, token);
 
-  const manager = opts.manager || new SessionManager(opts.managerOptions);
+  const metrics = opts.metrics || opts.manager?.metrics || new MetricsRegistry();
+  const manager = opts.manager || new SessionManager({ ...(opts.managerOptions || {}), metrics });
+  if (!manager.metrics) manager.metrics = metrics;
   const ownsManager = !opts.manager;
   const sseConnections = new Set();
 
@@ -117,20 +125,58 @@ export function createControlServer(opts = {}) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const p = url.pathname;
 
+    res.once('finish', () => {
+      metrics.recordHttp(req.method, p, res.statusCode);
+    });
+
     try {
+      // Serve static Mission Control HTML shell (contains zero session data; API/SSE calls enforce Bearer auth).
+      if (enableDashboard && (p === '/dashboard' || p === '/dashboard/')) {
+        requireMethod(req, 'GET');
+        const html = renderDashboardHtml({ requiresAuth: Boolean(token) });
+        const buf = Buffer.from(html, 'utf8');
+        res.writeHead(200, {
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': DASHBOARD_CSP,
+          'content-type': 'text/html; charset=utf-8',
+          'content-length': buf.length,
+        });
+        return res.end(buf);
+      }
+
       if (!verifyBearerToken(req.headers.authorization, token)) {
         return json(res, 401, { error: 'unauthorized' }, { 'www-authenticate': 'Bearer realm="agentbrowser"' });
       }
 
-      // ---------------- health & discovery ----------------
+      // ---------------- health, metrics & discovery ----------------
       if (p === '/api/health') {
         requireMethod(req, 'GET');
         return json(res, 200, {
           ready: manager.isBrowserReady(),
           engine: manager.engineLabel(),
+          version: '2.0.0',
           sessions: manager.sessions.size,
           maxSessions: manager.maxSessions,
+          dashboard: enableDashboard ? '/dashboard' : null,
         });
+      }
+
+      if (p === '/metrics') {
+        requireMethod(req, 'GET');
+        const body = metrics.renderPrometheus({ manager, sseClients: sseConnections.size });
+        const buf = Buffer.from(body, 'utf8');
+        res.writeHead(200, {
+          ...BASE_HEADERS,
+          'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+          'content-length': buf.length,
+        });
+        return res.end(buf);
+      }
+
+      if (p === '/api/metrics') {
+        requireMethod(req, 'GET');
+        return json(res, 200, { ok: true, ...metrics.summary({ manager, sseClients: sseConnections.size }) });
       }
 
       if (p === '/api/tools') {
@@ -160,8 +206,10 @@ export function createControlServer(opts = {}) {
         }
         const rawSid = req.headers['mcp-session-id'] || req.headers['x-session-id'] || 'default';
         const sid = validateSessionId(rawSid);
-        const invokeTool = createSessionExecutor(() => manager.getOrCreate(sid));
-        const reply = await dispatchMcpMessage(body, invokeTool);
+        const getSession = () => manager.getOrCreate(sid);
+        const invokeTool = createSessionExecutor(getSession, { taskOptions });
+        const readResource = createSessionResourceReader(getSession);
+        const reply = await dispatchMcpMessage(body, invokeTool, { readResource });
         if (reply === null) {
           res.writeHead(202, { ...BASE_HEADERS, 'mcp-session-id': sid });
           return res.end();
@@ -240,6 +288,17 @@ export function createControlServer(opts = {}) {
         return json(res, 200, session.devtoolsOverview());
       }
 
+      if (p === '/api/workflows') {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: false });
+        const workflows = await manager.workflowStore.list();
+        return json(res, 200, {
+          ok: true,
+          recording: session ? session.recorder.status() : { recording: false },
+          workflows,
+        });
+      }
+
       if (p === '/api/network') {
         requireMethod(req, 'GET');
         const session = resolveSession(manager, req, url, { create: true });
@@ -308,6 +367,15 @@ export function createControlServer(opts = {}) {
         return json(res, 200, { downloads: session.downloads });
       }
 
+      if (p.startsWith('/api/downloads/')) {
+        requireMethod(req, 'GET');
+        const session = resolveSession(manager, req, url, { create: false });
+        const id = decodeURIComponent(p.slice('/api/downloads/'.length));
+        const out = await session.act({ op: 'downloads', sub: 'inspect', id });
+        if (out?.error) throw new HttpError(404, out.error);
+        return json(res, 200, { ok: true, ...out.data });
+      }
+
       if (p === '/api/storage') {
         requireMethod(req, ['GET', 'POST']);
         const session = resolveSession(manager, req, url, { create: true });
@@ -325,7 +393,7 @@ export function createControlServer(opts = {}) {
         }
       }
 
-      // ---------------- actions & controls ----------------
+      // ---------------- actions, human takeover & governance ----------------
       if (p === '/api/act') {
         requireMethod(req, 'POST');
         requireJsonContentType(req);
@@ -344,6 +412,22 @@ export function createControlServer(opts = {}) {
         }
       }
 
+      if (p === '/api/takeover') {
+        requireMethod(req, 'POST');
+        requireJsonContentType(req);
+        const b = await readJsonBody(req, maxBodyBytes);
+        if (!b || typeof b !== 'object' || Array.isArray(b) || typeof b.op !== 'string') {
+          throw new HttpError(400, 'takeover object with string "op" required');
+        }
+        const session = resolveSession(manager, req, url, { create: true });
+        try {
+          const out = await session.takeover(b);
+          return json(res, 200, out);
+        } catch (e) {
+          throw new HttpError(400, e.message);
+        }
+      }
+
       if (p === '/api/task') {
         requireMethod(req, 'POST');
         requireJsonContentType(req);
@@ -352,10 +436,18 @@ export function createControlServer(opts = {}) {
         if (!goal) throw new HttpError(400, 'goal required');
         const session = resolveSession(manager, req, url, { create: true });
         if (session.busy) throw new HttpError(409, 'a task is already running');
+        const allowedTaskKeys = [
+          'mode', 'startUrl', 'fields', 'submitLabel', 'extractFormat',
+          'schema', 'selector', 'nextSelector', 'maxPages', 'maxSteps', 'maxActions', 'selfHeal',
+        ];
+        const reqTaskOpts = {};
+        for (const k of allowedTaskKeys) {
+          if (b[k] !== undefined) reqTaskOpts[k] = b[k];
+        }
         const ac = new AbortController();
         session.taskAbort = ac;
         session.busy = (async () => {
-          try { return await runTask(session, goal, { ...taskOptions, signal: ac.signal }); }
+          try { return await runTask(session, goal, { ...taskOptions, ...reqTaskOpts, signal: ac.signal }); }
           finally { session.busy = null; session.taskAbort = null; }
         })();
         const answer = await session.busy;
@@ -437,7 +529,6 @@ export function createControlServer(opts = {}) {
       const status = Number.isInteger(e.status) ? e.status : 500;
       const headers = e.headers || {};
       if (status === 413) {
-        // Close connection after 413 so we don't keep reading an oversized request stream.
         headers.connection = 'close';
       }
       if (!res.headersSent) {
@@ -456,11 +547,15 @@ export function createControlServer(opts = {}) {
       conn.cleanup();
       try { conn.res.end(); } catch {}
     }
-    await new Promise((resolve) => server.close(() => resolve()));
     if (ownsManager) await manager.shutdown();
+    server.closeIdleConnections?.();
+    await new Promise((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections?.();
+    });
   }
 
-  return { server, manager, close };
+  return { server, manager, metrics, close };
 }
 
 // Start the HTTP server only when executed directly (`node server.mjs` / `npm start`).
@@ -472,11 +567,11 @@ if (isMain) {
   const { server, manager, close } = createControlServer({ host: HOST });
 
   server.listen(PORT, HOST, async () => {
-    console.log(`AgentBrowser control plane → http://${HOST}:${PORT} (MCP: http://${HOST}:${PORT}/mcp)`);
+    console.log(`AgentBrowser v2.0 → http://${HOST}:${PORT} | Dashboard: /dashboard | MCP: /mcp | Metrics: /metrics`);
     try {
       const def = manager.getOrCreate('default');
       await def.init();
-      def.addLog('sys', 'ready · agent-only surface enabled · human browsing disabled');
+      def.addLog('sys', 'ready · v2.0 control plane, Mission Control dashboard & MCP up');
       await def.act({ op: 'open', url: 'about:blank' });
     } catch (e) {
       console.error('engine start failed:', e.message);
