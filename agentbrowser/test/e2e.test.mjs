@@ -197,7 +197,6 @@ test('Playwright Chromium E2E v2.0: cross-origin iframe, drag/dblclick/rightclic
   const fsp = await import('node:fs/promises');
 
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'ab-e2e-v2-'));
-  t.after(() => fsp.rm(tmp, { recursive: true, force: true }));
 
   // Secondary origin server (different port => true browser cross-origin iframe!)
   const xOriginServer = http.createServer((req, res) => {
@@ -209,7 +208,6 @@ test('Playwright Chromium E2E v2.0: cross-origin iframe, drag/dblclick/rightclic
     </body></html>`);
   });
   await new Promise((r) => xOriginServer.listen(0, '127.0.0.1', r));
-  t.after(() => new Promise((r) => xOriginServer.close(r)));
   const xPort = xOriginServer.address().port;
 
   // Primary fixture server: Kanban drag & drop, dblclick, rightclick, cross-origin iframe, CSV download, paginated catalog & modal self-heal
@@ -265,7 +263,6 @@ test('Playwright Chromium E2E v2.0: cross-origin iframe, drag/dblclick/rightclic
       </body></html>`);
   });
   await new Promise((r) => appServer.listen(0, '127.0.0.1', r));
-  t.after(() => new Promise((r) => appServer.close(r)));
   const basePage = `http://127.0.0.1:${appServer.address().port}`;
 
   const token = 'e2e-v2-token';
@@ -281,7 +278,15 @@ test('Playwright Chromium E2E v2.0: cross-origin iframe, drag/dblclick/rightclic
   });
   const ctl = createControlServer({ host: '127.0.0.1', token, manager });
   await new Promise((r) => ctl.server.listen(0, '127.0.0.1', r));
-  t.after(() => ctl.close());
+  t.after(async () => {
+    await ctl.close();
+    await manager.shutdown();
+    appServer.closeAllConnections?.();
+    xOriginServer.closeAllConnections?.();
+    await new Promise((r) => appServer.close(r));
+    await new Promise((r) => xOriginServer.close(r));
+    await fsp.rm(tmp, { recursive: true, force: true });
+  });
   const apiBase = `http://127.0.0.1:${ctl.server.address().port}`;
   const sdk = new AgentBrowser(apiBase, { token });
 
